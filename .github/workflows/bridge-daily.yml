@@ -16,7 +16,10 @@ jobs:
         with: { python-version: "3.12" }
       - run: pipx install poetry && poetry install --no-interaction
       - uses: actions/cache@v4
-        with: { path: .v2_cache, key: v2cache-${{ github.run_number }}, restore-keys: v2cache- }
+        with:
+          path: .v2_cache
+          key: "v2cache-${{ github.run_number }}"
+          restore-keys: v2cache-
       - name: run bridge
         env:
           FINANCIAL_DATASETS_API_KEY: ${{ secrets.FINANCIAL_DATASETS_API_KEY }}
