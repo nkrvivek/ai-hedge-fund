@@ -50,7 +50,13 @@ def main() -> None:
     console = Console(stderr=True)  # spinner on stderr; results stay pipeable
 
     started = time.time()
-    with FDClient() as raw:
+    import os
+    if os.environ.get("UW_TOKEN") and not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+        from v2.data.home_client import HomeDataClient
+        raw_client = HomeDataClient()
+    else:
+        raw_client = FDClient()
+    with raw_client as raw:
         # Disk cache: the snapshot built for the spinner is re-read for free
         # inside predict, and re-asking the same (ticker, date) costs nothing.
         fd = CachedDataClient(raw)

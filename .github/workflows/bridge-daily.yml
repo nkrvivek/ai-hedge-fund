@@ -15,6 +15,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pipx install poetry && poetry install --no-interaction
+      - uses: actions/cache@v4
+        with: { path: .v2_cache, key: v2cache-${{ github.run_number }}, restore-keys: v2cache- }
       - name: run bridge
         env:
           FINANCIAL_DATASETS_API_KEY: ${{ secrets.FINANCIAL_DATASETS_API_KEY }}
@@ -22,6 +24,8 @@ jobs:
           ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
           ALPACA_TRADING_ENDPOINT: https://paper-api.alpaca.markets/v2
+          UW_TOKEN: ${{ secrets.UW_TOKEN }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: poetry run python -m bridge.run_daily
       - name: commit ledger
         run: |

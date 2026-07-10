@@ -72,16 +72,22 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if not os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        print("BLOCKED: FINANCIAL_DATASETS_API_KEY missing — no signals possible. Exiting clean.")
-        return
-
     from v2.data import CachedDataClient, FDClient
     from v2.signals import ALPHA_MODEL_REGISTRY
 
     asof = date.today().isoformat()
     per_ticker: dict[str, dict] = {}
-    with FDClient() as raw:
+    if os.environ.get("UW_TOKEN"):
+        from v2.data.home_client import HomeDataClient
+        raw_client = HomeDataClient()
+        print("data plane: HomeDataClient (Alpaca+UW+FMP)")
+    elif os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+        raw_client = FDClient()
+        print("data plane: financialdatasets.ai")
+    else:
+        print("BLOCKED: no data credentials (UW_TOKEN or FINANCIAL_DATASETS_API_KEY). Exiting clean.")
+        return
+    with raw_client as raw:
         fd = CachedDataClient(raw)
         for ticker in UNIVERSE:
             views = {}
