@@ -1,0 +1,30 @@
+name: bridge-daily
+on:
+  schedule:
+    - cron: "35 14 * * 1-5"   # 10:35 ET — post-open, settled prices
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency: bridge-daily
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pipx install poetry && poetry install --no-interaction
+      - name: run bridge
+        env:
+          FINANCIAL_DATASETS_API_KEY: ${{ secrets.FINANCIAL_DATASETS_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_TRADING_ENDPOINT: https://paper-api.alpaca.markets/v2
+        run: poetry run python -m bridge.run_daily
+      - name: commit ledger
+        run: |
+          git config user.name "bridge-bot" && git config user.email "bridge@local"
+          git add bridge/ledger.jsonl || true
+          git diff --cached --quiet || git commit -m "ledger: $(date -u +%F)" && git push || true
