@@ -25,7 +25,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 UNIVERSE = ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "JPM", "XOM", "LLY"]
-AGENTS = ["buffett", "pead"]
+AGENTS = ["buffett", "damodaran", "munger", "burry", "wood", "lynch", "graham", "pead"]
 MAX_WEIGHT = 0.10          # per-name cap, long or short
 GROSS_CAP = 1.0            # total |weights| <= 100% of equity
 MIN_TRADE_USD = 200        # ignore rebalance dust
