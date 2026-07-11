@@ -92,62 +92,92 @@ class HomeDataClient:
                 break
         return out
 
-    # -- fundamentals (FMP ratios + key-metrics, quarterly) ------------------
+    # -- fundamentals (FMP; v3-quarterly for legacy keys, stable-annual for new) --
+    def _fmp_rows(self, ticker: str, limit: int) -> tuple[list, dict, dict]:
+        """Returns (ratio_rows, key_metrics_by_date, growth_by_date)."""
+        common = {"period": "quarter", "limit": max(limit * 2, 20), "apikey": self.fmp}
+        try:
+            ratios = self._get(f"{FMP}/ratios/{ticker}", {}, common) or []
+            kms = self._get(f"{FMP}/key-metrics/{ticker}", {}, common) or []
+            gr = self._get(f"{FMP}/financial-growth/{ticker}", {}, common) or []
+        except HomeClientError as e:
+            if "Legacy Endpoint" not in str(e):
+                raise
+            # post-2025 FMP key: /stable API; quarter is premium on ratios/
+            # key-metrics -> annual there, quarterly growth still allowed.
+            stable = "https://financialmodelingprep.com/stable"
+            # free stable tier: limit capped at 5
+            ann = {"symbol": ticker, "period": "annual", "limit": 5, "apikey": self.fmp}
+            qtr = {"symbol": ticker, "period": "quarter", "limit": 5, "apikey": self.fmp}
+            ratios = self._get(f"{stable}/ratios", {}, ann) or []
+            kms = self._get(f"{stable}/key-metrics", {}, ann) or []
+            gr = self._get(f"{stable}/financial-growth", {}, qtr) or []
+        return (ratios,
+                {r.get("date"): r for r in kms},
+                {r.get("date"): r for r in gr})
+
     def get_financial_metrics(self, ticker: str, end_date: str,
                               period: str = "ttm", limit: int = 10) -> list[FinancialMetrics]:
         if not self.fmp:
             return []
-        p = "quarter" if period in ("ttm", "quarterly", "quarter") else "annual"
-        common = {"period": p, "limit": max(limit * 2, 20), "apikey": self.fmp}
-        ratios = self._get(f"{FMP}/ratios/{ticker}", {}, common) or []
-        kms = {r.get("date"): r for r in (self._get(f"{FMP}/key-metrics/{ticker}", {}, common) or [])}
-        growth = {r.get("date"): r for r in (self._get(f"{FMP}/financial-growth/{ticker}", {}, common) or [])}
+        ratios, kms, growth = self._fmp_rows(ticker, limit)
+
+        def pk(*rows_keys: tuple) -> float | None:
+            for row, keys in rows_keys:
+                for k in keys:
+                    v = _num(row.get(k))
+                    if v is not None:
+                        return v
+            return None
+
         out: list[FinancialMetrics] = []
+        gdates = sorted(growth)
         for r in ratios:
             d = r.get("date")
-            if not d or d > end_date:  # point-in-time: period end must be filed by end_date;
-                continue               # FMP lacks filing_date here — period-end is the proxy.
-            km, gr = kms.get(d, {}), growth.get(d, {})
+            if not d or d > end_date:  # point-in-time proxy: period end by end_date
+                continue
+            km = kms.get(d, {})
+            gr = growth.get(d) or (growth.get(max((x for x in gdates if x <= d), default="")) or {})
             out.append(FinancialMetrics(
                 ticker=ticker, report_period=d, period=period, currency="USD",
-                market_cap=_num(km.get("marketCap")),
-                enterprise_value=_num(km.get("enterpriseValue")),
-                price_to_earnings_ratio=_num(r.get("priceEarningsRatio")),
-                price_to_book_ratio=_num(r.get("priceToBookRatio")),
-                price_to_sales_ratio=_num(r.get("priceToSalesRatio")),
-                enterprise_value_to_ebitda_ratio=_num(km.get("enterpriseValueOverEBITDA")),
-                enterprise_value_to_revenue_ratio=_num(km.get("evToSales")),
-                free_cash_flow_yield=_num(km.get("freeCashFlowYield")),
-                peg_ratio=_num(r.get("priceEarningsToGrowthRatio")),
-                gross_margin=_num(r.get("grossProfitMargin")),
-                operating_margin=_num(r.get("operatingProfitMargin")),
-                net_margin=_num(r.get("netProfitMargin")),
-                return_on_equity=_num(r.get("returnOnEquity")),
-                return_on_assets=_num(r.get("returnOnAssets")),
-                return_on_invested_capital=_num(km.get("roic")),
-                asset_turnover=_num(r.get("assetTurnover")),
-                inventory_turnover=_num(r.get("inventoryTurnover")),
-                receivables_turnover=_num(r.get("receivablesTurnover")),
-                days_sales_outstanding=_num(r.get("daysOfSalesOutstanding")),
-                operating_cycle=_num(r.get("operatingCycle")),
-                current_ratio=_num(r.get("currentRatio")),
-                quick_ratio=_num(r.get("quickRatio")),
-                cash_ratio=_num(r.get("cashRatio")),
-                operating_cash_flow_ratio=_num(r.get("operatingCashFlowSalesRatio")),
-                debt_to_equity=_num(r.get("debtEquityRatio")),
-                debt_to_assets=_num(r.get("debtRatio")),
-                interest_coverage=_num(r.get("interestCoverage")),
-                revenue_growth=_num(gr.get("revenueGrowth")),
-                earnings_growth=_num(gr.get("netIncomeGrowth")),
-                book_value_growth=_num(gr.get("bookValueperShareGrowth")),
-                earnings_per_share_growth=_num(gr.get("epsgrowth")),
-                free_cash_flow_growth=_num(gr.get("freeCashFlowGrowth")),
-                operating_income_growth=_num(gr.get("operatingIncomeGrowth")),
-                ebitda_growth=_num(gr.get("ebitgrowth")),
-                payout_ratio=_num(r.get("payoutRatio")),
-                earnings_per_share=_num(km.get("netIncomePerShare")),
-                book_value_per_share=_num(km.get("bookValuePerShare")),
-                free_cash_flow_per_share=_num(km.get("freeCashFlowPerShare")),
+                market_cap=pk((km, ("marketCap",))),
+                enterprise_value=pk((km, ("enterpriseValue",))),
+                price_to_earnings_ratio=pk((r, ("priceEarningsRatio", "priceToEarningsRatio"))),
+                price_to_book_ratio=pk((r, ("priceToBookRatio",))),
+                price_to_sales_ratio=pk((r, ("priceToSalesRatio",))),
+                enterprise_value_to_ebitda_ratio=pk((km, ("enterpriseValueOverEBITDA", "evToEBITDA"))),
+                enterprise_value_to_revenue_ratio=pk((km, ("evToSales",))),
+                free_cash_flow_yield=pk((km, ("freeCashFlowYield",))),
+                peg_ratio=pk((r, ("priceEarningsToGrowthRatio", "priceToEarningsGrowthRatio"))),
+                gross_margin=pk((r, ("grossProfitMargin",))),
+                operating_margin=pk((r, ("operatingProfitMargin",))),
+                net_margin=pk((r, ("netProfitMargin",))),
+                return_on_equity=pk((r, ("returnOnEquity",)), (km, ("returnOnEquity",))),
+                return_on_assets=pk((r, ("returnOnAssets",)), (km, ("returnOnAssets",))),
+                return_on_invested_capital=pk((km, ("roic", "returnOnInvestedCapital"))),
+                asset_turnover=pk((r, ("assetTurnover",))),
+                inventory_turnover=pk((r, ("inventoryTurnover",))),
+                receivables_turnover=pk((r, ("receivablesTurnover",))),
+                days_sales_outstanding=pk((r, ("daysOfSalesOutstanding",)), (km, ("daysOfSalesOutstanding",))),
+                operating_cycle=pk((r, ("operatingCycle",)), (km, ("operatingCycle",))),
+                current_ratio=pk((r, ("currentRatio",))),
+                quick_ratio=pk((r, ("quickRatio",))),
+                cash_ratio=pk((r, ("cashRatio",))),
+                operating_cash_flow_ratio=pk((r, ("operatingCashFlowSalesRatio",))),
+                debt_to_equity=pk((r, ("debtEquityRatio", "debtToEquityRatio"))),
+                debt_to_assets=pk((r, ("debtRatio", "debtToAssetsRatio"))),
+                interest_coverage=pk((r, ("interestCoverage", "interestCoverageRatio"))),
+                revenue_growth=pk((gr, ("revenueGrowth",))),
+                earnings_growth=pk((gr, ("netIncomeGrowth",))),
+                book_value_growth=pk((gr, ("bookValueperShareGrowth",))),
+                earnings_per_share_growth=pk((gr, ("epsgrowth", "epsGrowth"))),
+                free_cash_flow_growth=pk((gr, ("freeCashFlowGrowth",))),
+                operating_income_growth=pk((gr, ("operatingIncomeGrowth",))),
+                ebitda_growth=pk((gr, ("ebitgrowth", "ebitdaGrowth"))),
+                payout_ratio=pk((r, ("payoutRatio", "dividendPayoutRatio"))),
+                earnings_per_share=pk((km, ("netIncomePerShare",)), (r, ("netIncomePerShare",))),
+                book_value_per_share=pk((km, ("bookValuePerShare",)), (r, ("bookValuePerShare",))),
+                free_cash_flow_per_share=pk((km, ("freeCashFlowPerShare",)), (r, ("freeCashFlowPerShare",))),
             ))
             if len(out) >= limit:
                 break
