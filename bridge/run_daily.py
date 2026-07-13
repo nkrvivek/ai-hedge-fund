@@ -108,7 +108,8 @@ def main() -> None:
     broker = AlpacaPaper()
     acct = broker.account()
     equity = float(acct["equity"])
-    orders = rebalance_orders(targets, broker.positions(), equity)
+    current_mv = broker.positions()
+    orders = rebalance_orders(targets, current_mv, equity)
 
     print(f"\nequity=${equity:,.0f} targets={ {t: round(w,3) for t,w in targets.items()} }")
     print(f"orders ({len(orders)}): {orders}")
@@ -118,6 +119,19 @@ def main() -> None:
         for o in orders:
             try:
                 body = {"notional": abs(o["delta_usd"]), "side": o["side"]}
+                if o["side"] == "sell":
+                    # Alpaca 422 42210000: fractional (notional) orders cannot
+                    # sell short — shorts must be whole-share qty orders.
+                    held = current_mv.get(o["symbol"], 0.0)
+                    if held <= 0 or abs(o["delta_usd"]) > held:
+                        px = broker.latest_price(o["symbol"])
+                        if not px:
+                            raise RuntimeError("no price for whole-share short sizing")
+                        qty = int(abs(o["delta_usd"]) // px)
+                        if qty < 1:
+                            placed.append({**o, "skipped": "short_below_one_share"})
+                            continue
+                        body = {"qty": str(qty), "side": "sell"}
                 res = broker.submit_market_order(o["symbol"], body)
                 placed.append({**o, "order_id": res.get("id"), "status": res.get("status")})
                 print(f"  placed {o['side']} ${abs(o['delta_usd'])} {o['symbol']} -> {res.get('status')}")
