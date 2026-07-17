@@ -29,6 +29,11 @@ jobs:
           ALPACA_TRADING_ENDPOINT: https://paper-api.alpaca.markets/v2
           UW_TOKEN: ${{ secrets.UW_TOKEN }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          # 2026-07-17: daily digest email (secrets exist but were unmapped —
+          # GH only exposes secrets explicitly listed here).
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
         run: poetry run python -m bridge.run_daily
       - name: commit ledger
         run: |
