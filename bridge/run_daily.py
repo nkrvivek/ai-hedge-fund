@@ -125,9 +125,16 @@ def main() -> None:
     # loudly, not dilute silently into neutral.
     fail_ratio = llm_failure_ratio(per_ticker)
     if fail_ratio > 0.5:
-        print(f"FATAL: {fail_ratio:.0%} of committee signals are LLM/agent "
-              "failures — refusing to rebalance on a dead committee. "
-              "Check the ANTHROPIC_API_KEY credit balance / provider status.")
+        msg = (f"FATAL: {fail_ratio:.0%} of committee signals are LLM/agent "
+               "failures — refusing to rebalance on a dead committee. "
+               "Check the ANTHROPIC_API_KEY credit balance / provider status.")
+        print(msg)
+        try:
+            _send_daily_email(asof=asof, equity=0.0, convictions={},
+                              targets={}, placed=[],
+                              fail_ratio=fail_ratio, dry_run=True)
+        except Exception:  # noqa: BLE001
+            pass
         sys.exit(2)
 
     convictions = {t: composite([v["value"] for v in views.values()])
@@ -178,6 +185,60 @@ def main() -> None:
             "dry_run": args.dry_run,
         }) + "\n")
     print(f"\nledger appended -> {LEDGER}")
+
+    _send_daily_email(asof=asof, equity=equity, convictions=convictions,
+                      targets=targets, placed=placed if placed else orders,
+                      fail_ratio=fail_ratio, dry_run=args.dry_run)
+
+
+def _send_daily_email(*, asof: str, equity: float, convictions: dict,
+                      targets: dict, placed: list, fail_ratio: float,
+                      dry_run: bool) -> None:
+    """Daily digest via Resend (2026-07-17 user directive: 'I'm not getting
+    any email for AI hedge fund, enable that'). Best-effort — an email
+    failure never fails the run. Requires RESEND_API_KEY/FROM/TO env
+    (GH secrets on the fork; absent locally → silent skip)."""
+    import urllib.request
+    key = os.getenv("RESEND_API_KEY")
+    frm = os.getenv("RESEND_FROM")
+    to = os.getenv("RESEND_TO")
+    if not (key and frm and to):
+        print("email skip: RESEND_* not configured")
+        return
+    ranked = sorted(convictions.items(), key=lambda kv: -kv[1])
+    conv_lines = "".join(
+        f"<tr><td style='padding:2px 10px'>{t}</td>"
+        f"<td style='padding:2px 10px;text-align:right'>{c:+.2f}</td>"
+        f"<td style='padding:2px 10px;text-align:right'>{targets.get(t, 0):.1%}</td></tr>"
+        for t, c in ranked)
+    order_lines = "".join(
+        f"<li>{o.get('side','?')} ${abs(o.get('delta_usd', 0)):,.0f} "
+        f"{o.get('symbol','?')} — {o.get('status') or o.get('error') or o.get('skipped') or 'staged'}</li>"
+        for o in placed) or "<li>no rebalance orders</li>"
+    health = ("🟢 committee healthy" if fail_ratio == 0
+              else f"🟡 {fail_ratio:.0%} committee signals failed")
+    html = (
+        f"<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>"
+        f"<h3 style='margin:0 0 8px'>[ai-hedge-fund] {asof} — equity ${equity:,.0f}"
+        f"{' (DRY RUN)' if dry_run else ''}</h3>"
+        f"<p style='margin:4px 0'>{health}</p>"
+        f"<table style='border-collapse:collapse;font-size:13px'>"
+        f"<tr><th style='padding:2px 10px;text-align:left'>ticker</th>"
+        f"<th style='padding:2px 10px'>conviction</th>"
+        f"<th style='padding:2px 10px'>target</th></tr>{conv_lines}</table>"
+        f"<p style='margin:8px 0 4px'><b>Orders</b></p><ul style='margin:0;font-size:13px'>{order_lines}</ul>"
+        f"</div>")
+    payload = json.dumps({"from": frm, "to": [to],
+                          "subject": f"[ai-hedge-fund] daily — equity ${equity:,.0f} · {asof}",
+                          "html": html}).encode()
+    req = urllib.request.Request("https://api.resend.com/emails", data=payload,
+                                 headers={"Authorization": f"Bearer {key}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            print(f"email sent: {r.status}")
+    except Exception as e:  # noqa: BLE001
+        print(f"email FAILED (non-fatal): {e}")
 
 
 if __name__ == "__main__":
