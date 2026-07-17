@@ -228,12 +228,16 @@ def _send_daily_email(*, asof: str, equity: float, convictions: dict,
         f"<th style='padding:2px 10px'>target</th></tr>{conv_lines}</table>"
         f"<p style='margin:8px 0 4px'><b>Orders</b></p><ul style='margin:0;font-size:13px'>{order_lines}</ul>"
         f"</div>")
-    payload = json.dumps({"from": frm, "to": [to],
+    payload = json.dumps({"from": frm,
+                          "to": [t.strip() for t in to.split(",") if t.strip()],
                           "subject": f"[ai-hedge-fund] daily — equity ${equity:,.0f} · {asof}",
                           "html": html}).encode()
+    # Cloudflare bot-fight 403s python-urllib's default UA (error 1010) —
+    # same gotcha as the 2026-07-15 cloud IBKR screen port. Real UA required.
     req = urllib.request.Request("https://api.resend.com/emails", data=payload,
                                  headers={"Authorization": f"Bearer {key}",
-                                          "Content-Type": "application/json"})
+                                          "Content-Type": "application/json",
+                                          "User-Agent": "ai-hedge-fund-bridge/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             print(f"email sent: {r.status}")
