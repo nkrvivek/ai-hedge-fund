@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -66,6 +67,23 @@ def rebalance_orders(
     return orders
 
 
+def llm_failure_ratio(per_ticker: dict[str, dict]) -> float:
+    """Fraction of committee signals that are failures rather than opinions.
+
+    A failed signal is an abstain/error produced by the plumbing, not the
+    model's judgment: reasoning starts with 'LLM call failed' (llm_agent
+    abstain path) or 'ERROR:' (run_daily per-agent catch). 0.0 on an empty
+    committee (nothing to judge — the no-credentials path exits earlier)."""
+    total = failed = 0
+    for views in per_ticker.values():
+        for v in views.values():
+            total += 1
+            reason = str(v.get("reasoning") or "")
+            if reason.startswith("LLM call failed") or reason.startswith("ERROR:"):
+                failed += 1
+    return (failed / total) if total else 0.0
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser()
@@ -99,6 +117,18 @@ def main() -> None:
                     views[agent] = {"value": 0.0, "reasoning": f"ERROR: {e}"}
             per_ticker[ticker] = views
             print(f"{ticker}: " + " ".join(f"{a}={v['value']:+.2f}" for a, v in views.items()))
+
+    # 2026-07-17 (dead-committee incident): the Anthropic key ran out of
+    # credits on 7/16-17 — all 7 LLM personas abstained on every ticker,
+    # the run stayed GREEN, and the book rebalanced for 2 days on the PEAD
+    # quant alone. Dead personas must HALT rebalancing and fail the run
+    # loudly, not dilute silently into neutral.
+    fail_ratio = llm_failure_ratio(per_ticker)
+    if fail_ratio > 0.5:
+        print(f"FATAL: {fail_ratio:.0%} of committee signals are LLM/agent "
+              "failures — refusing to rebalance on a dead committee. "
+              "Check the ANTHROPIC_API_KEY credit balance / provider status.")
+        sys.exit(2)
 
     convictions = {t: composite([v["value"] for v in views.values()])
                    for t, views in per_ticker.items()}
