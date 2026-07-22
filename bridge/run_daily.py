@@ -30,6 +30,7 @@ AGENTS = ["buffett", "damodaran", "munger", "burry", "wood", "lynch", "graham", 
 MAX_WEIGHT = 0.10          # per-name cap, long or short
 GROSS_CAP = 1.0            # total |weights| <= 100% of equity
 MIN_TRADE_USD = 200        # ignore rebalance dust
+FAIL_THRESHOLD = 0.5       # committee failure ratio that halts a run (global) or excludes a ticker
 LEDGER = Path(__file__).parent / "ledger.jsonl"
 
 
@@ -52,11 +53,18 @@ def target_weights(convictions: dict[str, float]) -> dict[str, float]:
 
 
 def rebalance_orders(
-    targets: dict[str, float], current_mv: dict[str, float], equity: float
+    targets: dict[str, float], current_mv: dict[str, float], equity: float,
+    excluded: frozenset[str] = frozenset(),
 ) -> list[dict]:
-    """Diff target dollar exposure vs current. Pure fn. Returns order intents."""
+    """Diff target dollar exposure vs current. Pure fn. Returns order intents.
+
+    `excluded` tickers (dead committee — see ticker_failure_ratios) are held
+    exactly as-is: no buy, no sell, regardless of target or current value.
+    A data outage is not a reason to force-close a position."""
     orders = []
     for symbol in sorted(set(targets) | set(current_mv)):
+        if symbol in excluded:
+            continue
         want = targets.get(symbol, 0.0) * equity
         have = current_mv.get(symbol, 0.0)
         delta = want - have
@@ -67,21 +75,45 @@ def rebalance_orders(
     return orders
 
 
-def llm_failure_ratio(per_ticker: dict[str, dict]) -> float:
-    """Fraction of committee signals that are failures rather than opinions.
+def _is_failed_signal(v: dict) -> bool:
+    """A signal counts as a committee failure: plumbing, not judgment.
 
-    A failed signal is an abstain/error produced by the plumbing, not the
-    model's judgment: reasoning starts with 'LLM call failed' (llm_agent
-    abstain path) or 'ERROR:' (run_daily per-agent catch). 0.0 on an empty
-    committee (nothing to judge — the no-credentials path exits earlier)."""
+    2026-07-22 audit: the abstain path (v2/signals/llm_agent.py
+    `_abstain()`) writes reasoning prefixed 'abstained: ...', not
+    'LLM call failed' — the old string-match here missed every abstain
+    and undercounted a dead committee (87.5% true failure read as
+    8.75%). Read the `abstained` metadata flag directly instead; still
+    count the run_daily per-agent except catch ('ERROR:' reasoning,
+    v.get('abstained') is never set there)."""
+    return bool(v.get("abstained")) or str(v.get("reasoning") or "").startswith("ERROR:")
+
+
+def llm_failure_ratio(per_ticker: dict[str, dict]) -> float:
+    """Fraction of committee signals (all tickers, all agents) that are
+    failures rather than opinions. 0.0 on an empty committee (nothing to
+    judge — the no-credentials path exits earlier)."""
     total = failed = 0
     for views in per_ticker.values():
         for v in views.values():
             total += 1
-            reason = str(v.get("reasoning") or "")
-            if reason.startswith("LLM call failed") or reason.startswith("ERROR:"):
+            if _is_failed_signal(v):
                 failed += 1
     return (failed / total) if total else 0.0
+
+
+def ticker_failure_ratios(per_ticker: dict[str, dict]) -> dict[str, float]:
+    """Per-ticker committee failure ratio, same rule as llm_failure_ratio.
+
+    2026-07-22 audit: LLY's committee was 100% dead (FMP 402) the same day
+    the global ratio read 8.75% — a single dead endpoint for one ticker
+    hides inside a healthy-looking global average. Callers exclude any
+    ticker at/above FAIL_THRESHOLD from target_weights."""
+    ratios = {}
+    for ticker, views in per_ticker.items():
+        total = len(views)
+        failed = sum(1 for v in views.values() if _is_failed_signal(v))
+        ratios[ticker] = (failed / total) if total else 0.0
+    return ratios
 
 
 def main() -> None:
@@ -112,7 +144,8 @@ def main() -> None:
             for agent in AGENTS:
                 try:
                     sig = ALPHA_MODEL_REGISTRY[agent]().predict(ticker, asof, fd)
-                    views[agent] = {"value": sig.value, "reasoning": sig.reasoning}
+                    views[agent] = {"value": sig.value, "reasoning": sig.reasoning,
+                                    "abstained": bool(sig.metadata.get("abstained", False))}
                 except Exception as e:  # one agent failing must not kill the run
                     views[agent] = {"value": 0.0, "reasoning": f"ERROR: {e}"}
             per_ticker[ticker] = views
@@ -124,7 +157,7 @@ def main() -> None:
     # quant alone. Dead personas must HALT rebalancing and fail the run
     # loudly, not dilute silently into neutral.
     fail_ratio = llm_failure_ratio(per_ticker)
-    if fail_ratio > 0.5:
+    if fail_ratio >= FAIL_THRESHOLD:
         msg = (f"FATAL: {fail_ratio:.0%} of committee signals are LLM/agent "
                "failures — refusing to rebalance on a dead committee. "
                "Check the ANTHROPIC_API_KEY credit balance / provider status.")
@@ -132,13 +165,25 @@ def main() -> None:
         try:
             _send_daily_email(asof=asof, equity=0.0, convictions={},
                               targets={}, placed=[],
-                              fail_ratio=fail_ratio, dry_run=True)
+                              fail_ratio=fail_ratio, dry_run=True,
+                              halt_reason=msg)
         except Exception:  # noqa: BLE001
             pass
         sys.exit(2)
 
+    # 2026-07-22 (per-ticker audit finding): a single ticker's committee can
+    # be wiped out (e.g. LLY, FMP 402) while the global ratio stays low.
+    # Exclude that ticker from target_weights entirely — no new position —
+    # and hold whatever is already there untouched (no forced close on a
+    # data outage). The global halt above still fires on top of this.
+    ticker_ratios = ticker_failure_ratios(per_ticker)
+    excluded = {t: r for t, r in ticker_ratios.items() if r >= FAIL_THRESHOLD}
+    if excluded:
+        print("excluded (dead committee, held as-is): "
+              + ", ".join(f"{t} {r:.0%}" for t, r in sorted(excluded.items())))
+
     convictions = {t: composite([v["value"] for v in views.values()])
-                   for t, views in per_ticker.items()}
+                   for t, views in per_ticker.items() if t not in excluded}
     targets = target_weights(convictions)
 
     from bridge.alpaca import AlpacaPaper
@@ -146,7 +191,7 @@ def main() -> None:
     acct = broker.account()
     equity = float(acct["equity"])
     current_mv = broker.positions()
-    orders = rebalance_orders(targets, current_mv, equity)
+    orders = rebalance_orders(targets, current_mv, equity, excluded=frozenset(excluded))
 
     print(f"\nequity=${equity:,.0f} targets={ {t: round(w,3) for t,w in targets.items()} }")
     print(f"orders ({len(orders)}): {orders}")
@@ -182,22 +227,29 @@ def main() -> None:
             "asof": asof, "equity": equity,
             "signals": per_ticker, "convictions": convictions,
             "targets": targets, "orders": placed if placed else orders,
+            "excluded": excluded,
             "dry_run": args.dry_run,
         }) + "\n")
     print(f"\nledger appended -> {LEDGER}")
 
     _send_daily_email(asof=asof, equity=equity, convictions=convictions,
                       targets=targets, placed=placed if placed else orders,
-                      fail_ratio=fail_ratio, dry_run=args.dry_run)
+                      fail_ratio=fail_ratio, dry_run=args.dry_run,
+                      excluded=excluded)
 
 
 def _send_daily_email(*, asof: str, equity: float, convictions: dict,
                       targets: dict, placed: list, fail_ratio: float,
-                      dry_run: bool) -> None:
+                      dry_run: bool, excluded: dict[str, float] | None = None,
+                      halt_reason: str | None = None) -> None:
     """Daily digest via Resend (2026-07-17 user directive: 'I'm not getting
     any email for AI hedge fund, enable that'). Best-effort — an email
     failure never fails the run. Requires RESEND_API_KEY/FROM/TO env
-    (GH secrets on the fork; absent locally → silent skip)."""
+    (GH secrets on the fork; absent locally → silent skip).
+
+    `halt_reason` set (global gate tripped, bridge/run_daily.py FATAL path)
+    sends a bare HALTED notice instead of the normal digest table — there
+    is no digest to show, only the reason no trades happened."""
     import urllib.request
     key = os.getenv("RESEND_API_KEY")
     frm = os.getenv("RESEND_FROM")
@@ -205,32 +257,51 @@ def _send_daily_email(*, asof: str, equity: float, convictions: dict,
     if not (key and frm and to):
         print("email skip: RESEND_* not configured")
         return
-    ranked = sorted(convictions.items(), key=lambda kv: -kv[1])
-    conv_lines = "".join(
-        f"<tr><td style='padding:2px 10px'>{t}</td>"
-        f"<td style='padding:2px 10px;text-align:right'>{c:+.2f}</td>"
-        f"<td style='padding:2px 10px;text-align:right'>{targets.get(t, 0):.1%}</td></tr>"
-        for t, c in ranked)
-    order_lines = "".join(
-        f"<li>{o.get('side','?')} ${abs(o.get('delta_usd', 0)):,.0f} "
-        f"{o.get('symbol','?')} — {o.get('status') or o.get('error') or o.get('skipped') or 'staged'}</li>"
-        for o in placed) or "<li>no rebalance orders</li>"
-    health = ("🟢 committee healthy" if fail_ratio == 0
-              else f"🟡 {fail_ratio:.0%} committee signals failed")
-    html = (
-        f"<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>"
-        f"<h3 style='margin:0 0 8px'>[ai-hedge-fund] {asof} — equity ${equity:,.0f}"
-        f"{' (DRY RUN)' if dry_run else ''}</h3>"
-        f"<p style='margin:4px 0'>{health}</p>"
-        f"<table style='border-collapse:collapse;font-size:13px'>"
-        f"<tr><th style='padding:2px 10px;text-align:left'>ticker</th>"
-        f"<th style='padding:2px 10px'>conviction</th>"
-        f"<th style='padding:2px 10px'>target</th></tr>{conv_lines}</table>"
-        f"<p style='margin:8px 0 4px'><b>Orders</b></p><ul style='margin:0;font-size:13px'>{order_lines}</ul>"
-        f"</div>")
+    excluded = excluded or {}
+
+    if halt_reason:
+        subject = f"[ai-hedge-fund] {asof} — HALTED — no trades: {halt_reason}"
+        html = (
+            f"<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>"
+            f"<h3 style='margin:0 0 8px'>[ai-hedge-fund] {asof} — HALTED — no trades</h3>"
+            f"<p style='margin:4px 0'>🔴 {halt_reason}</p>"
+            f"</div>")
+    else:
+        ranked = sorted(convictions.items(), key=lambda kv: -kv[1])
+        conv_lines = "".join(
+            f"<tr><td style='padding:2px 10px'>{t}</td>"
+            f"<td style='padding:2px 10px;text-align:right'>{c:+.2f}</td>"
+            f"<td style='padding:2px 10px;text-align:right'>{targets.get(t, 0):.1%}</td></tr>"
+            for t, c in ranked)
+        order_lines = "".join(
+            f"<li>{o.get('side','?')} ${abs(o.get('delta_usd', 0)):,.0f} "
+            f"{o.get('symbol','?')} — {o.get('status') or o.get('error') or o.get('skipped') or 'staged'}</li>"
+            for o in placed) or "<li>no rebalance orders</li>"
+        if excluded:
+            health = ("🔴 excluded (dead committee, held as-is): "
+                      + ", ".join(f"{t} {r:.0%} failed" for t, r in sorted(excluded.items())))
+        elif fail_ratio >= FAIL_THRESHOLD:
+            health = f"🔴 {fail_ratio:.0%} committee signals failed"
+        elif fail_ratio > 0:
+            health = f"🟡 {fail_ratio:.0%} committee signals failed"
+        else:
+            health = "🟢 committee healthy"
+        html = (
+            f"<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>"
+            f"<h3 style='margin:0 0 8px'>[ai-hedge-fund] {asof} — equity ${equity:,.0f}"
+            f"{' (DRY RUN)' if dry_run else ''}</h3>"
+            f"<p style='margin:4px 0'>{health}</p>"
+            f"<table style='border-collapse:collapse;font-size:13px'>"
+            f"<tr><th style='padding:2px 10px;text-align:left'>ticker</th>"
+            f"<th style='padding:2px 10px'>conviction</th>"
+            f"<th style='padding:2px 10px'>target</th></tr>{conv_lines}</table>"
+            f"<p style='margin:8px 0 4px'><b>Orders</b></p><ul style='margin:0;font-size:13px'>{order_lines}</ul>"
+            f"</div>")
+        subject = f"[ai-hedge-fund] daily — equity ${equity:,.0f} · {asof}"
+
     payload = json.dumps({"from": frm,
                           "to": [t.strip() for t in to.split(",") if t.strip()],
-                          "subject": f"[ai-hedge-fund] daily — equity ${equity:,.0f} · {asof}",
+                          "subject": subject,
                           "html": html}).encode()
     # Cloudflare bot-fight 403s python-urllib's default UA (error 1010) —
     # same gotcha as the 2026-07-15 cloud IBKR screen port. Real UA required.
