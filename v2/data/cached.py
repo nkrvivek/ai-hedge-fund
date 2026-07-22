@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 from typing import Callable
 
@@ -82,9 +83,15 @@ class CachedDataClient:
         )
 
     def get_earnings_history(self, ticker, limit=12):
+        # Unlike get_prices/get_financial_metrics/get_market_cap, this method
+        # takes no end_date — the key had no date component at all, so a
+        # ticker's first-ever fetch was cached forever (the GH Actions cache
+        # restore-key chain inherits every prior day's file). A new earnings
+        # filing would never be seen again. Stamp the key with today's date
+        # so each calendar day gets its own entry, same as the dated methods.
         return self._cached_list(
             "get_earnings_history", EarningsRecord,
-            {"ticker": ticker, "limit": limit},
+            {"ticker": ticker, "limit": limit, "as_of": date.today().isoformat()},
             lambda: self._client.get_earnings_history(ticker, limit),
         )
 
@@ -95,8 +102,11 @@ class CachedDataClient:
         )
 
     def get_earnings(self, ticker):
+        # Same frozen-cache gap as get_earnings_history (no date in the key)
+        # and get_earnings is itself sourced from earnings history — same fix.
         return self._cached_item(
-            "get_earnings", Earnings, {"ticker": ticker},
+            "get_earnings", Earnings,
+            {"ticker": ticker, "as_of": date.today().isoformat()},
             lambda: self._client.get_earnings(ticker),
         )
 
