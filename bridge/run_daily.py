@@ -40,16 +40,22 @@ def composite(signals: list[float]) -> float:
 
 
 def target_weights(convictions: dict[str, float]) -> dict[str, float]:
-    """Conviction-proportional weights, per-name cap, gross cap. Pure fn."""
-    raw = {t: v for t, v in convictions.items() if v != 0.0}
+    """Conviction-proportional LONG-ONLY weights, per-name cap, gross cap.
+    Pure fn.
+
+    2026-07-23: the Alpaca paper account refuses shorts (POST /orders 403
+    code 40310000 "account is not allowed to short"), so every bearish
+    target errored daily and the ledger diverged from the real book.
+    Negative conviction now maps to NO position — sell to zero, hold cash —
+    the closest expressible portfolio inside the account's limits. The
+    conviction table in the ledger/email still shows the raw negative
+    values, so the committee's bearish view stays visible."""
+    raw = {t: v for t, v in convictions.items() if v > 0.0}
     if not raw:
         return {}
-    gross = sum(abs(v) for v in raw.values())
+    gross = sum(raw.values())
     scale = GROSS_CAP / gross if gross > GROSS_CAP else 1.0
-    return {
-        t: max(-MAX_WEIGHT, min(MAX_WEIGHT, v * scale))
-        for t, v in raw.items()
-    }
+    return {t: min(MAX_WEIGHT, v * scale) for t, v in raw.items()}
 
 
 def rebalance_orders(
@@ -202,18 +208,23 @@ def main() -> None:
             try:
                 body = {"notional": abs(o["delta_usd"]), "side": o["side"]}
                 if o["side"] == "sell":
-                    # Alpaca 422 42210000: fractional (notional) orders cannot
-                    # sell short — shorts must be whole-share qty orders.
+                    # Long-only account (403 40310000): sells only reduce a
+                    # held long, never open a short. Full exits go through
+                    # the broker-sized close-position endpoint so a stale
+                    # local MV can't oversell (2026-07-23 META
+                    # insufficient-qty class).
                     held = current_mv.get(o["symbol"], 0.0)
-                    if held <= 0 or abs(o["delta_usd"]) > held:
-                        px = broker.latest_price(o["symbol"])
-                        if not px:
-                            raise RuntimeError("no price for whole-share short sizing")
-                        qty = int(abs(o["delta_usd"]) // px)
-                        if qty < 1:
-                            placed.append({**o, "skipped": "short_below_one_share"})
-                            continue
-                        body = {"qty": str(qty), "side": "sell"}
+                    if held <= 0:
+                        placed.append({**o, "skipped": "nothing_held_long_only"})
+                        continue
+                    if targets.get(o["symbol"], 0.0) <= 0.0 or abs(o["delta_usd"]) >= held:
+                        res = broker.close_position(o["symbol"]) or {}
+                        placed.append({**o, "order_id": res.get("id"),
+                                       "status": res.get("status", "closed"),
+                                       "liquidated": True})
+                        print(f"  liquidated {o['symbol']} (long-only full exit) -> {res.get('status', 'closed')}")
+                        continue
+                    body = {"notional": round(min(abs(o["delta_usd"]), held), 2), "side": "sell"}
                 res = broker.submit_market_order(o["symbol"], body)
                 placed.append({**o, "order_id": res.get("id"), "status": res.get("status")})
                 print(f"  placed {o['side']} ${abs(o['delta_usd'])} {o['symbol']} -> {res.get('status')}")
@@ -228,6 +239,7 @@ def main() -> None:
             "signals": per_ticker, "convictions": convictions,
             "targets": targets, "orders": placed if placed else orders,
             "excluded": excluded,
+            "long_only": True,
             "dry_run": args.dry_run,
         }) + "\n")
     print(f"\nledger appended -> {LEDGER}")

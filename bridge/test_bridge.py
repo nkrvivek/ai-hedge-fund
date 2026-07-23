@@ -19,6 +19,25 @@ def test_weights_capped_per_name_and_gross():
     assert sum(abs(x) for x in w.values()) <= 1.0 + 1e-9
 
 
+def test_weights_long_only_drops_bearish_names():
+    # 2026-07-23: Alpaca paper refuses shorts (403 40310000) — bearish
+    # conviction maps to no position, never a negative weight.
+    w = target_weights({"UP": 0.5, "DOWN": -0.8, "FLAT": 0.0})
+    assert "DOWN" not in w and "FLAT" not in w
+    assert w["UP"] > 0
+    assert all(x > 0 for x in w.values())
+
+
+def test_rebalance_bearish_name_sells_held_never_more():
+    # Bearish name absent from targets: order sells exactly what is held.
+    orders = rebalance_orders({"UP": 0.10}, {"DOWN": 3000.0}, 100_000)
+    by = {o["symbol"]: o for o in orders}
+    assert by["DOWN"]["side"] == "sell"
+    assert abs(by["DOWN"]["delta_usd"]) == 3000.0
+    # And a name with nothing held generates no sell at all.
+    assert "GHOST" not in {o["symbol"] for o in rebalance_orders({}, {}, 100_000)}
+
+
 def test_rebalance_diffs_and_dust_filter():
     orders = rebalance_orders({"A": 0.10}, {"A": 9000.0, "B": 5000.0}, 100_000)
     by = {o["symbol"]: o for o in orders}

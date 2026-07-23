@@ -68,6 +68,12 @@ class AlpacaPaper:
         body = {"symbol": symbol, "type": "market", "time_in_force": "day", **notional_or_qty}
         return self._req("POST", "/orders", json=body)
 
+    def close_position(self, symbol: str) -> dict | None:
+        """Liquidate the full position via Alpaca's close-position endpoint —
+        broker-sized, so a stale local market value can never oversell (the
+        2026-07-23 META insufficient-qty failure class)."""
+        return self._req("DELETE", f"/positions/{symbol}")
+
     def latest_price(self, symbol: str) -> float | None:
         """Best-effort last trade price via the data API (paper key works)."""
         try:
