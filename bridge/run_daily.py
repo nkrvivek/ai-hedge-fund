@@ -232,6 +232,15 @@ def main() -> None:
                 placed.append({**o, "error": str(e)})
                 print(f"  FAILED {o['symbol']}: {e}")
 
+    # Index-hedge sleeve (INDEX_HEDGE_RULE.md, approved 2026-07-24): the only
+    # place bearish net conviction becomes a position — long XSP puts,
+    # defined risk. Runs after the stock rebalance; never raises. Ledger
+    # attribution sleeve="index_hedge" keeps the 8/10 eval clean.
+    from bridge.index_hedge import run_index_hedge
+    hedge = run_index_hedge(broker, convictions=convictions, equity=equity,
+                            dry_run=args.dry_run)
+    print(f"index_hedge: {hedge.get('action')} — {hedge.get('reason', '')}")
+
     with LEDGER.open("a") as f:
         f.write(json.dumps({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -240,6 +249,7 @@ def main() -> None:
             "targets": targets, "orders": placed if placed else orders,
             "excluded": excluded,
             "long_only": True,
+            "index_hedge": hedge,
             "dry_run": args.dry_run,
         }) + "\n")
     print(f"\nledger appended -> {LEDGER}")
@@ -247,13 +257,32 @@ def main() -> None:
     _send_daily_email(asof=asof, equity=equity, convictions=convictions,
                       targets=targets, placed=placed if placed else orders,
                       fail_ratio=fail_ratio, dry_run=args.dry_run,
-                      excluded=excluded)
+                      excluded=excluded, hedge=hedge)
+
+
+def _hedge_email_line(hedge: dict | None) -> str:
+    """One line splitting the hedge from the picks — a trough print must read
+    as volatility, not committee failure (2026-07-23 lesson, $5K book)."""
+    if not hedge:
+        return ""
+    puts = hedge.get("open_puts") or []
+    if puts:
+        cost = sum(abs(float(p.get("cost_basis") or 0)) for p in puts)
+        mark = sum(abs(float(p.get("market_value") or 0)) for p in puts)
+        detail = (f"{len(puts)} XSP put leg(s) · mark ${mark:,.0f} "
+                  f"(cost ${cost:,.0f}, unrealized {mark - cost:+,.0f})")
+    else:
+        detail = "no open hedge"
+    return (f"<p style='margin:4px 0;font-size:13px'><b>Index hedge</b> "
+            f"(sleeve, excluded from picks eval): {detail} · today: "
+            f"{hedge.get('action')} — {hedge.get('reason', '')}</p>")
 
 
 def _send_daily_email(*, asof: str, equity: float, convictions: dict,
                       targets: dict, placed: list, fail_ratio: float,
                       dry_run: bool, excluded: dict[str, float] | None = None,
-                      halt_reason: str | None = None) -> None:
+                      halt_reason: str | None = None,
+                      hedge: dict | None = None) -> None:
     """Daily digest via Resend (2026-07-17 user directive: 'I'm not getting
     any email for AI hedge fund, enable that'). Best-effort — an email
     failure never fails the run. Requires RESEND_API_KEY/FROM/TO env
@@ -308,6 +337,7 @@ def _send_daily_email(*, asof: str, equity: float, convictions: dict,
             f"<th style='padding:2px 10px'>conviction</th>"
             f"<th style='padding:2px 10px'>target</th></tr>{conv_lines}</table>"
             f"<p style='margin:8px 0 4px'><b>Orders</b></p><ul style='margin:0;font-size:13px'>{order_lines}</ul>"
+            f"{_hedge_email_line(hedge)}"
             f"</div>")
         subject = f"[ai-hedge-fund] daily — equity ${equity:,.0f} · {asof}"
 

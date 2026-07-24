@@ -1,7 +1,9 @@
-# Index-hedge sleeve — XSP puts (DRAFT v1, 2026-07-23)
+# Index-hedge sleeve — XSP puts (v1, approved 2026-07-24)
 
-Status: DRAFT — user review pending. No code exists for this yet; nothing
-trades until the user approves the rule AND the start date.
+Status: APPROVED + WIRED (bridge/index_hedge.py, runs in run_daily after the
+stock rebalance). Start decision (user, 2026-07-24): live now, but the arm
+threshold is −5.0 until the 8/10 eval ends; the −1.5 rule below applies
+after 8/10. Reference: 7/23 read −3.75 does NOT arm before 8/10.
 
 ## Why
 
@@ -45,11 +47,10 @@ Reference point: 2026-07-23 read = −3.75 across 9 names (8 bearish).
   mark, cost, unrealized, % of equity — a trough print must read as
   volatility, not committee failure (2026-07-23 lesson, $5K book).
 
-## Open decision (user)
+## Start decision (resolved 2026-07-24)
 
-**Start date**: ① now — hedge live during the eval window, ledger-separated
-so the eval stays clean on paper; ② after the 8/10 eval — zero
-contamination risk, but the committee's strongest bearish read to date
-goes unexpressed for 2.5 more weeks. Drafter's lean: ② unless the
-committee's net conviction deepens below −5, which would make the
-unexpressed view itself the bigger eval distortion.
+User picked the escape hatch as the rule: live immediately, arm only if
+net conviction drops below −5.0 before the 8/10 eval ends (the unexpressed
+view becomes the bigger distortion at that depth); normal −1.5 arm after
+8/10. Implemented as `PRE_EVAL_ARM_THRESHOLD` / `EVAL_END` in
+bridge/index_hedge.py.

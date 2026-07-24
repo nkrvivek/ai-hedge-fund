@@ -64,9 +64,54 @@ class AlpacaPaper:
             out[p["symbol"]] = float(p["market_value"])
         return out
 
+    def positions_full(self) -> list[dict]:
+        """Raw position dicts — the index-hedge sleeve needs qty/cost_basis."""
+        return self._req("GET", "/positions") or []
+
     def submit_market_order(self, symbol: str, notional_or_qty: dict) -> dict:
         body = {"symbol": symbol, "type": "market", "time_in_force": "day", **notional_or_qty}
         return self._req("POST", "/orders", json=body)
+
+    def submit_limit_order(self, symbol: str, *, qty: int, side: str,
+                           limit_price: float) -> dict:
+        body = {"symbol": symbol, "qty": str(qty), "side": side, "type": "limit",
+                "limit_price": str(round(limit_price, 2)), "time_in_force": "day"}
+        return self._req("POST", "/orders", json=body)
+
+    def option_contracts(self, underlying: str, *, type_: str, today,
+                         dte_min: int, dte_max: int,
+                         strike_min: float, strike_max: float) -> list[dict]:
+        """Tradable option contracts from the trading API (paper host)."""
+        from datetime import timedelta
+        params = {
+            "underlying_symbols": underlying,
+            "type": type_,
+            "status": "active",
+            "expiration_date_gte": (today + timedelta(days=dte_min)).isoformat(),
+            "expiration_date_lte": (today + timedelta(days=dte_max)).isoformat(),
+            "strike_price_gte": str(round(strike_min, 2)),
+            "strike_price_lte": str(round(strike_max, 2)),
+            "limit": 200,
+        }
+        resp = self._req("GET", "/options/contracts", params=params) or {}
+        return resp.get("option_contracts") or []
+
+    def option_quote_latest(self, symbol: str) -> tuple[float, float] | None:
+        """(bid, ask) from the options data API; None when unquoted."""
+        try:
+            resp = self.session.get(
+                "https://data.alpaca.markets/v1beta1/options/quotes/latest",
+                params={"symbols": symbol}, timeout=15,
+            )
+            if not resp.ok:
+                return None
+            q = (resp.json().get("quotes") or {}).get(symbol)
+            if not q:
+                return None
+            bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+            return (bid, ask) if ask > 0 else None
+        except Exception:
+            return None
 
     def close_position(self, symbol: str) -> dict | None:
         """Liquidate the full position via Alpaca's close-position endpoint —
