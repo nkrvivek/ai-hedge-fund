@@ -137,6 +137,16 @@ def main() -> None:
         from v2.data.home_client import HomeDataClient
         raw_client = HomeDataClient()
         print("data plane: HomeDataClient (Alpaca+UW+FMP)")
+        # FMP gates some symbols behind a per-symbol paywall (402). LLY hit
+        # this 2026-07-22 and was excluded from the book. When an FD key is
+        # present, back fundamentals with financialdatasets.ai for exactly
+        # the tickers FMP can't serve. Absent the key, no change.
+        if os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            from v2.data.fallback_client import FundamentalsFallbackClient
+            raw_client = FundamentalsFallbackClient(raw_client, FDClient())
+            print("fundamentals fallback: financialdatasets.ai (FMP-blocked tickers only)")
+        else:
+            print("fundamentals fallback: OFF (no FINANCIAL_DATASETS_API_KEY)")
     elif os.environ.get("FINANCIAL_DATASETS_API_KEY"):
         raw_client = FDClient()
         print("data plane: financialdatasets.ai")
@@ -156,6 +166,11 @@ def main() -> None:
                     views[agent] = {"value": 0.0, "reasoning": f"ERROR: {e}"}
             per_ticker[ticker] = views
             print(f"{ticker}: " + " ".join(f"{a}={v['value']:+.2f}" for a, v in views.items()))
+
+    served = getattr(raw_client, "fallback_tickers", [])
+    if served:
+        print("fundamentals fallback served: "
+              + ", ".join(sorted(set(served))))
 
     # 2026-07-17 (dead-committee incident): the Anthropic key ran out of
     # credits on 7/16-17 — all 7 LLM personas abstained on every ticker,
