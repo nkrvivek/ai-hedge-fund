@@ -113,6 +113,17 @@ class AlpacaPaper:
         except Exception:
             return None
 
+    def get_order(self, order_id: str) -> dict | None:
+        """Fetch one order — used to read fill qty/avg price for the trade
+        ledger. Best-effort: returns None on any failure rather than raising
+        into the ledger path."""
+        if not order_id:
+            return None
+        try:
+            return self._req("GET", f"/orders/{order_id}")
+        except Exception:  # noqa: BLE001 — ledger read must never break a run
+            return None
+
     def close_position(self, symbol: str) -> dict | None:
         """Liquidate the full position via Alpaca's close-position endpoint —
         broker-sized, so a stale local market value can never oversell (the

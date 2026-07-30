@@ -269,6 +269,30 @@ def main() -> None:
         }) + "\n")
     print(f"\nledger appended -> {LEDGER}")
 
+    # Canonical per-fill ledger (TRADE_LEDGER_SCHEMA.md) — separate store from
+    # the daily digest above, same shape as the autopilot books. Guarded: a
+    # ledger write never breaks the run. Only real placed orders book rows;
+    # a dry run books nothing.
+    if not args.dry_run:
+        try:
+            from bridge import trade_ledger as tl
+            rows = []
+            for i, o in enumerate(placed):
+                fill = broker.get_order(o.get("order_id")) if o.get("order_id") else None
+                rec = tl.record_for_rebalance(o, fill, seq=i)
+                if rec:
+                    rows.append(rec)
+            hfill = (broker.get_order(hedge.get("order_id"))
+                     if hedge.get("order_id") else None)
+            hrec = tl.record_for_hedge_open(hedge, hfill)
+            if hrec:
+                rows.append(hrec)
+            rows.extend(tl.records_for_hedge_close(hedge))
+            n = tl.write_records(rows)
+            print(f"trade ledger: {n} fill row(s) -> {tl.LEDGER_PATH}")
+        except Exception as e:  # noqa: BLE001 — never break a run on the ledger
+            print(f"trade ledger FAILED (non-fatal): {e}")
+
     _send_daily_email(asof=asof, equity=equity, convictions=convictions,
                       targets=targets, placed=placed if placed else orders,
                       fail_ratio=fail_ratio, dry_run=args.dry_run,
