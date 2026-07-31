@@ -105,6 +105,35 @@ def test_both_empty_returns_empty_no_raise():
     assert fb.fallback_tickers == []
 
 
+def test_nested_chain_prefers_uw_over_fd_for_paywalled_ticker():
+    """run_daily wiring: Home -> UW -> FD. When FMP (home) 402s a ticker, UW's
+    deep history must serve it and FD must never be consulted — UW's 5 rows clear
+    MIN_PERIODS where FD's shallow 3 would not."""
+    home = _Stub(raises=RuntimeError("GET /stable/ratios 402: not available"))
+    uw = _Stub(rows=[_metric("LLY") for _ in range(5)])
+    fd = _Stub(rows=[_metric("LLY") for _ in range(3)])
+
+    chain = FundamentalsFallbackClient(FundamentalsFallbackClient(home, uw), fd)
+    rows = chain.get_financial_metrics("LLY", "2026-07-31")
+
+    assert len(rows) == 5      # UW's deep history, not FD's shallow 3
+    assert uw.calls == 1
+    assert fd.calls == 0       # FD never reached
+
+
+def test_nested_chain_falls_to_fd_only_when_uw_also_blind():
+    """FD remains a real last resort: reached only if both FMP and UW are blind."""
+    home = _Stub(raises=RuntimeError("402 paywall"))
+    uw = _Stub(rows=[])        # UW has no coverage for this name
+    fd = _Stub(rows=[_metric("ZZZ") for _ in range(4)])
+
+    chain = FundamentalsFallbackClient(FundamentalsFallbackClient(home, uw), fd)
+    rows = chain.get_financial_metrics("ZZZ", "2026-07-31")
+
+    assert len(rows) == 4
+    assert uw.calls == 1 and fd.calls == 1
+
+
 def test_delegation_passthrough():
     primary = _Stub(rows=[])
     secondary = _Stub(rows=[])

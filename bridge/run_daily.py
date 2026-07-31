@@ -81,6 +81,24 @@ def rebalance_orders(
     return orders
 
 
+def buy_order_body(delta_usd: float, price: float | None) -> dict:
+    """Size a BUY as a whole-share qty market order, never a notional order.
+
+    2026-07-24..07-31: notional BUYs reject with POST /orders 403 code
+    40310000 ("insufficient qty available", available == existing qty) —
+    Alpaca's oversell-shaped error on the buy side (AMZN 7/24, JPM 7/27,
+    MSFT 7/31). The rejected buys silently never built, so the book drifted
+    from target. Whole-share qty market buys avoid the notional/fractional
+    path. Same lesson class as the 2026-07-23 sell-side close_position fix.
+    Pure fn."""
+    if not price or price <= 0:
+        return {"skip": "no_price"}
+    qty = int(delta_usd // price)
+    if qty < 1:
+        return {"skip": "sub_share_dust"}
+    return {"qty": str(qty), "side": "buy"}
+
+
 def _is_failed_signal(v: dict) -> bool:
     """A signal counts as a committee failure: plumbing, not judgment.
 
@@ -134,19 +152,25 @@ def main() -> None:
     asof = date.today().isoformat()
     per_ticker: dict[str, dict] = {}
     if os.environ.get("UW_TOKEN"):
+        from v2.data.fallback_client import FundamentalsFallbackClient
         from v2.data.home_client import HomeDataClient
+        from v2.data.uw_fundamentals import UWFundamentalsClient
         raw_client = HomeDataClient()
         print("data plane: HomeDataClient (Alpaca+UW+FMP)")
-        # FMP gates some symbols behind a per-symbol paywall (402). LLY hit
-        # this 2026-07-22 and was excluded from the book. When an FD key is
-        # present, back fundamentals with financialdatasets.ai for exactly
-        # the tickers FMP can't serve. Absent the key, no change.
+        # FMP gates some symbols behind a per-symbol paywall (402). LLY hit this
+        # 2026-07-22 and its committee ran fully dead. Back fundamentals with UW
+        # statements (deep quarterly history we already pay flat-rate for) for
+        # exactly the tickers FMP can't serve. UW is tried BEFORE financialdatasets
+        # because its history is deep enough to clear MIN_PERIODS where FD's shallow
+        # ~3-quarter window was not: FD returned 3 filed periods for LLY (< 4), UW
+        # returns 5+. FD stays as a further backstop only if UW is also blind.
+        raw_client = FundamentalsFallbackClient(raw_client, UWFundamentalsClient())
+        print("fundamentals fallback #1: UnusualWhales statements (FMP-blocked tickers)")
         if os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-            from v2.data.fallback_client import FundamentalsFallbackClient
             raw_client = FundamentalsFallbackClient(raw_client, FDClient())
-            print("fundamentals fallback: financialdatasets.ai (FMP-blocked tickers only)")
+            print("fundamentals fallback #2: financialdatasets.ai (only if UW also blind)")
         else:
-            print("fundamentals fallback: OFF (no FINANCIAL_DATASETS_API_KEY)")
+            print("fundamentals fallback #2: OFF (no FINANCIAL_DATASETS_API_KEY)")
     elif os.environ.get("FINANCIAL_DATASETS_API_KEY"):
         raw_client = FDClient()
         print("data plane: financialdatasets.ai")
@@ -221,7 +245,6 @@ def main() -> None:
     if not args.dry_run:
         for o in orders:
             try:
-                body = {"notional": abs(o["delta_usd"]), "side": o["side"]}
                 if o["side"] == "sell":
                     # Long-only account (403 40310000): sells only reduce a
                     # held long, never open a short. Full exits go through
@@ -240,6 +263,15 @@ def main() -> None:
                         print(f"  liquidated {o['symbol']} (long-only full exit) -> {res.get('status', 'closed')}")
                         continue
                     body = {"notional": round(min(abs(o["delta_usd"]), held), 2), "side": "sell"}
+                else:
+                    # BUY: whole-share qty, never notional. Notional buys 403
+                    # with the oversell-shaped 40310000 (AMZN/JPM/MSFT
+                    # 7/24-7/31) and silently never build. See buy_order_body.
+                    body = buy_order_body(abs(o["delta_usd"]), broker.latest_price(o["symbol"]))
+                    if "skip" in body:
+                        placed.append({**o, "skipped": body["skip"]})
+                        print(f"  skipped buy {o['symbol']}: {body['skip']}")
+                        continue
                 res = broker.submit_market_order(o["symbol"], body)
                 placed.append({**o, "order_id": res.get("id"), "status": res.get("status")})
                 print(f"  placed {o['side']} ${abs(o['delta_usd'])} {o['symbol']} -> {res.get('status')}")

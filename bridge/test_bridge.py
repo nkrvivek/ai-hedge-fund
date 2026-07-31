@@ -1,10 +1,19 @@
 from bridge.run_daily import (
+    buy_order_body,
     composite,
     llm_failure_ratio,
     rebalance_orders,
     target_weights,
     ticker_failure_ratios,
 )
+
+
+def test_buy_uses_whole_share_qty_not_notional():
+    # 2026-07-31 MSFT: notional buy 403'd (40310000). Whole-share qty avoids it.
+    assert buy_order_body(9849.0, 464.2) == {"qty": "21", "side": "buy"}
+    assert buy_order_body(150.0, 464.2) == {"skip": "sub_share_dust"}
+    assert buy_order_body(9849.0, None) == {"skip": "no_price"}
+    assert buy_order_body(9849.0, 0) == {"skip": "no_price"}
 
 
 def test_composite_ignores_abstains():
