@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -83,13 +84,6 @@ def rebalance_orders(
 
 def buy_order_body(delta_usd: float, price: float | None) -> dict:
     """Size a BUY as a whole-share qty market order, never a notional order.
-
-    2026-07-24..07-31: notional BUYs reject with POST /orders 403 code
-    40310000 ("insufficient qty available", available == existing qty) —
-    Alpaca's oversell-shaped error on the buy side (AMZN 7/24, JPM 7/27,
-    MSFT 7/31). The rejected buys silently never built, so the book drifted
-    from target. Whole-share qty market buys avoid the notional/fractional
-    path. Same lesson class as the 2026-07-23 sell-side close_position fix.
     Pure fn."""
     if not price or price <= 0:
         return {"skip": "no_price"}
@@ -97,6 +91,32 @@ def buy_order_body(delta_usd: float, price: float | None) -> dict:
     if qty < 1:
         return {"skip": "sub_share_dust"}
     return {"qty": str(qty), "side": "buy"}
+
+
+def held_short(market_value: float) -> bool:
+    """True when the symbol holds a short position (negative market value).
+
+    2026-07-31 root cause of the recurring buy-403: the book carried tiny
+    fractional SHORT dust (MSFT -0.0022 sh, MV -$1.04; also AAPL/AMZN/JPM/NVDA/
+    TSLA/XOM) left by prior notional-sell rounding. A BUY — notional or
+    whole-share qty — rejects with POST /orders 403 code 40310000 ("insufficient
+    qty available", available == existing qty) while ANY fractional lot is open.
+    Proven live: close_position then buy clears. The account is long-only, so a
+    negative market value is always unwanted dust to flatten before buying."""
+    return market_value < 0.0
+
+
+def flatten_and_wait(broker, symbol: str, *, tries: int = 12, pause: float = 0.5) -> bool:
+    """Close a short/dust position and poll until Alpaca reports it flat, so a
+    following whole-share BUY on the same symbol clears instead of 403-ing
+    against the still-open lot. Back-to-back close+buy would race. Bounded;
+    returns True once the symbol drops out of the positions list."""
+    broker.close_position(symbol)
+    for _ in range(tries):
+        if symbol not in broker.positions():
+            return True
+        time.sleep(pause)
+    return False
 
 
 def _is_failed_signal(v: dict) -> bool:
@@ -264,9 +284,15 @@ def main() -> None:
                         continue
                     body = {"notional": round(min(abs(o["delta_usd"]), held), 2), "side": "sell"}
                 else:
-                    # BUY: whole-share qty, never notional. Notional buys 403
-                    # with the oversell-shaped 40310000 (AMZN/JPM/MSFT
-                    # 7/24-7/31) and silently never build. See buy_order_body.
+                    # BUY: a whole-share qty buy 403s (40310000) while the
+                    # symbol still holds a fractional SHORT lot (2026-07-31 root
+                    # cause — see held_short). Flatten that dust and wait until
+                    # flat before buying, so the buy clears. Long-only invariant:
+                    # any short here is unwanted anyway.
+                    if held_short(current_mv.get(o["symbol"], 0.0)):
+                        flat = flatten_and_wait(broker, o["symbol"])
+                        print(f"  flattened short dust {o['symbol']} "
+                              f"(MV ${current_mv[o['symbol']]:.2f}) -> flat={flat}")
                     body = buy_order_body(abs(o["delta_usd"]), broker.latest_price(o["symbol"]))
                     if "skip" in body:
                         placed.append({**o, "skipped": body["skip"]})

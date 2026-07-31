@@ -16,6 +16,43 @@ def test_buy_uses_whole_share_qty_not_notional():
     assert buy_order_body(9849.0, 0) == {"skip": "no_price"}
 
 
+def test_held_short_detects_short_dust():
+    # 2026-07-31 root cause: the book carried tiny fractional SHORT dust
+    # (MSFT -0.0022 sh, MV -$1.04) left by prior notional-sell rounding. A
+    # whole-share BUY 403s (40310000) while any fractional lot is open — proven
+    # live: close_position then buy clears. The account is long-only, so a
+    # negative market value is always unwanted dust to flatten before buying.
+    from bridge.run_daily import held_short
+    assert held_short(-1.04) is True
+    assert held_short(-0.0001) is True
+    assert held_short(0.0) is False
+    assert held_short(9852.0) is False
+
+
+def test_flatten_and_wait_closes_then_polls_until_flat():
+    # Mirrors the verified fix: close the short, poll until Alpaca reports the
+    # symbol flat, THEN the whole-share buy can clear. Back-to-back close+buy
+    # would race the still-open lot.
+    from bridge.run_daily import flatten_and_wait
+
+    class _FakeBroker:
+        def __init__(self):
+            self.closed = []
+            self._poll = 0
+
+        def close_position(self, symbol):
+            self.closed.append(symbol)
+            return {"status": "pending_new"}
+
+        def positions(self):
+            self._poll += 1
+            return {"MSFT": -1.04} if self._poll < 2 else {}
+
+    b = _FakeBroker()
+    assert flatten_and_wait(b, "MSFT", tries=5, pause=0) is True
+    assert b.closed == ["MSFT"]
+
+
 def test_composite_ignores_abstains():
     assert composite([0.6, 0.0]) == 0.6
     assert composite([0.0, 0.0]) == 0.0
