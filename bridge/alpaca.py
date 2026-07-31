@@ -130,6 +130,33 @@ class AlpacaPaper:
         2026-07-23 META insufficient-qty failure class)."""
         return self._req("DELETE", f"/positions/{symbol}")
 
+    def snapshot_movers(self, symbols: list[str]) -> dict[str, tuple[float, float]]:
+        """symbol -> (price, pct_move) for many symbols in ONE snapshot call.
+
+        Price is the latest trade; pct_move is that price against the prior
+        session close (dailyBar can't help pre-open, prevDailyBar always can).
+        Used to rank the curated theme pool by today's move without a request
+        per name (2026-07-31). A symbol missing either field is skipped rather
+        than fabricated. Raises on API failure so the caller degrades loudly to
+        the fixed core."""
+        if not symbols:
+            return {}
+        resp = self.session.get(
+            "https://data.alpaca.markets/v2/stocks/snapshots",
+            params={"symbols": ",".join(symbols)}, timeout=20,
+        )
+        if not resp.ok:
+            raise AlpacaPaperError(f"snapshots {resp.status_code}: {resp.text[:200]}")
+        out: dict[str, tuple[float, float]] = {}
+        for sym, snap in (resp.json() or {}).items():
+            snap = snap or {}
+            price = (snap.get("latestTrade") or {}).get("p")
+            prev = (snap.get("prevDailyBar") or {}).get("c")
+            if price is None or not prev:
+                continue
+            out[sym] = (float(price), float(price) / float(prev) - 1.0)
+        return out
+
     def latest_price(self, symbol: str) -> float | None:
         """Best-effort last trade price via the data API (paper key works)."""
         try:

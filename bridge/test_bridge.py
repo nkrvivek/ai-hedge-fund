@@ -53,6 +53,63 @@ def test_flatten_and_wait_closes_then_polls_until_flat():
     assert b.closed == ["MSFT"]
 
 
+def test_build_universe_adds_fresh_keeps_core_and_held():
+    from bridge.run_daily import build_universe
+    core = ["AAPL", "MSFT"]
+    held = ["LLY", "AAPL"]  # AAPL overlaps core -> dedupe
+    fresh = [("NVDA", 120.0), ("AAPL", 220.0), ("PLTR", 30.0),
+             ("PENNY", 2.0), ("LLY", 900.0), ("AMD", 150.0)]
+    u = build_universe(core, held, fresh, k_fresh=2, price_floor=5.0)
+    # core, then held-not-in-core, order-stable and deduped
+    assert u[:3] == ["AAPL", "MSFT", "LLY"]
+    assert u.count("AAPL") == 1
+    # fresh: NVDA (new) + PLTR (new) fill k=2; AAPL/LLY skipped (already in),
+    # PENNY below the price floor, AMD never reached (cap hit).
+    assert "NVDA" in u and "PLTR" in u
+    assert "PENNY" not in u
+    assert "AMD" not in u
+
+
+def test_rank_movers_orders_by_absolute_move_and_carries_price():
+    # 2026-07-31 (user: "large cap movers and AI and memory stocks"): fresh
+    # candidates come from a curated quality pool ranked by today's move
+    # magnitude, not Alpaca volume-most-actives (which surfaced leveraged ETFs
+    # and pennies). Biggest movers first; a down move ranks by magnitude, not
+    # sign; missing snapshots drop out.
+    from bridge.run_daily import rank_movers
+    pool = ["MU", "NVDA", "AMD", "GHOST"]
+    snaps = {
+        "MU": (838.0, -0.042),   # -4.2%
+        "NVDA": (180.0, 0.011),  # +1.1%
+        "AMD": (150.0, 0.070),   # +7.0% -> biggest
+        # GHOST absent
+    }
+    ranked = rank_movers(pool, snaps)
+    assert [s for s, _ in ranked] == ["AMD", "MU", "NVDA"]  # |7| > |4.2| > |1.1|
+    assert dict(ranked)["MU"] == 838.0  # price carried through for the floor
+    assert "GHOST" not in dict(ranked)  # no snapshot -> excluded
+
+
+def test_build_universe_never_orphans_a_held_name():
+    from bridge.run_daily import build_universe
+    u = build_universe(["MSFT"], ["ZZZ"], [], k_fresh=5)
+    assert "ZZZ" in u and "MSFT" in u  # held kept even with no fresh candidates
+
+
+def test_llm_failure_ratio_gate_restricts_to_core_tickers():
+    # A fresh name with no fundamentals goes dead; it must NOT trip the global
+    # dead-committee HALT gate — that gate detects credit/provider death, which
+    # would kill the core anchors too. Per-ticker exclusion still drops it.
+    from bridge.run_daily import llm_failure_ratio
+    per_ticker = {
+        "AAPL": {"buffett": {"value": 0.6, "reasoning": "ok", "abstained": False}},
+        "FRESHX": {"buffett": {"value": 0.0, "reasoning": "abstained: insufficient data",
+                               "abstained": True}},
+    }
+    assert llm_failure_ratio(per_ticker) == 0.5                      # unrestricted
+    assert llm_failure_ratio(per_ticker, gate_tickers={"AAPL"}) == 0.0  # core-gated
+
+
 def test_composite_ignores_abstains():
     assert composite([0.6, 0.0]) == 0.6
     assert composite([0.0, 0.0]) == 0.0

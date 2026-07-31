@@ -27,6 +27,23 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 UNIVERSE = ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "JPM", "XOM", "LLY"]
+# Curated fresh-candidate pool (2026-07-31, user: "large cap movers and AI and
+# memory stocks"). Volume most-actives surfaced leveraged ETFs + pennies the
+# fundamentals committee can't value, so fresh names are drawn from THIS pool of
+# investable large-caps, ranked each day by move magnitude. Every name here has
+# real financials — so a fresh pick actually gets scored, not abstained-and-dropped.
+THEME_POOL = [
+    # AI / semis
+    "AMD", "AVGO", "TSM", "ARM", "MRVL", "SMCI", "QCOM", "INTC", "ASML",
+    "LRCX", "AMAT", "KLAC", "ADI", "TXN", "ON", "MPWR", "ANET", "DELL",
+    # AI software / platforms
+    "PLTR", "CRM", "NOW", "SNOW", "ORCL", "ADBE", "CRWD", "PANW", "IBM",
+    # Memory (user emphasis)
+    "MU", "WDC", "STX",
+    # Other large-cap movers
+    "NFLX", "DIS", "V", "MA", "WMT", "COST", "UNH", "HD", "UBER", "ABNB",
+    "COIN", "GE", "CAT", "BA",
+]
 AGENTS = ["buffett", "damodaran", "munger", "burry", "wood", "lynch", "graham", "pead"]
 MAX_WEIGHT = 0.10          # per-name cap, long or short
 GROSS_CAP = 1.0            # total |weights| <= 100% of equity
@@ -132,17 +149,66 @@ def _is_failed_signal(v: dict) -> bool:
     return bool(v.get("abstained")) or str(v.get("reasoning") or "").startswith("ERROR:")
 
 
-def llm_failure_ratio(per_ticker: dict[str, dict]) -> float:
-    """Fraction of committee signals (all tickers, all agents) that are
-    failures rather than opinions. 0.0 on an empty committee (nothing to
-    judge — the no-credentials path exits earlier)."""
+def llm_failure_ratio(per_ticker: dict[str, dict],
+                      gate_tickers: set[str] | None = None) -> float:
+    """Fraction of committee signals that are failures rather than opinions.
+    0.0 on an empty committee (nothing to judge — the no-credentials path exits
+    earlier).
+
+    gate_tickers restricts the count to those tickers. The dead-committee HALT
+    gate passes the CORE anchors: credit exhaustion / provider outage kills the
+    core too, so it still fires — but a fresh most-active name that simply has no
+    fundamentals (FMP 402 + UW blind) can't tip the gate into a false HALT
+    (2026-07-31, when the universe grew past the fixed 10). Per-ticker exclusion
+    still drops such a dead fresh name from target_weights."""
     total = failed = 0
-    for views in per_ticker.values():
+    for ticker, views in per_ticker.items():
+        if gate_tickers is not None and ticker not in gate_tickers:
+            continue
         for v in views.values():
             total += 1
             if _is_failed_signal(v):
                 failed += 1
     return (failed / total) if total else 0.0
+
+
+def build_universe(core: list[str], held: list[str],
+                   fresh: list[tuple[str, float | None]],
+                   k_fresh: int = 10, price_floor: float = 5.0) -> list[str]:
+    """Daily ticker universe = fixed core anchors + every held name (never orphan
+    a position — the committee must score a holding to keep/trim/exit it) + the
+    top-K fresh most-active names above the price floor. Order-stable and deduped:
+    core first, then held-not-core, then fresh. Pure fn.
+
+    fresh: (symbol, price) pairs, most-active first. A None or sub-floor price
+    drops the name (illiquid/penny noise the committee shouldn't chase)."""
+    seen = set(core) | set(held)
+    picked: list[str] = []
+    for sym, price in fresh:
+        if len(picked) >= k_fresh:
+            break
+        if sym in seen or price is None or price < price_floor:
+            continue
+        picked.append(sym)
+        seen.add(sym)
+    out: list[str] = []
+    for sym in [*core, *held, *picked]:
+        if sym not in out:
+            out.append(sym)
+    return out
+
+
+def rank_movers(pool: list[str],
+                snaps: dict[str, tuple[float, float]]) -> list[tuple[str, float]]:
+    """Order the theme pool by today's move magnitude, biggest first.
+
+    snaps: symbol -> (price, pct_move). Missing snapshots drop out. Returns
+    (symbol, price) pairs — the shape build_universe's `fresh` arg expects —
+    ranked so the day's real movers rotate in ahead of the quiet names. Sign is
+    ignored: a big drop is as worth scoring as a big pop. Pure fn."""
+    rated = [(sym, snaps[sym][0], snaps[sym][1]) for sym in pool if sym in snaps]
+    rated.sort(key=lambda r: abs(r[2]), reverse=True)
+    return [(sym, price) for sym, price, _ in rated]
 
 
 def ticker_failure_ratios(per_ticker: dict[str, dict]) -> dict[str, float]:
@@ -197,9 +263,31 @@ def main() -> None:
     else:
         print("BLOCKED: no data credentials (UW_TOKEN or FINANCIAL_DATASETS_API_KEY). Exiting clean.")
         return
+    # Build the day's universe = core anchors + held names + fresh theme-pool
+    # movers (2026-07-31, user: "large cap movers and AI and memory stocks" —
+    # rotate fresh names in, but from a curated investable pool, not volume
+    # most-actives which surfaced leveraged ETFs + pennies the committee can't
+    # value). Broker built once here and reused for the rebalance below. A
+    # snapshot failure degrades loudly to the fixed core — never kills the run.
+    from bridge.alpaca import AlpacaPaper
+    broker = AlpacaPaper()
+    current_mv = broker.positions()
+    held = list(current_mv.keys())
+    try:
+        snaps = broker.snapshot_movers(THEME_POOL)
+        fresh = rank_movers(THEME_POOL, snaps)
+        universe = build_universe(list(UNIVERSE), held, fresh)
+        added = [s for s in universe if s not in set(UNIVERSE) | set(held)]
+        print(f"universe ({len(universe)}): core {len(UNIVERSE)} + held {len(held)} "
+              f"+ fresh {len(added)} {added} -> {universe}")
+    except Exception as e:  # noqa: BLE001 — screener is best-effort, core is safe
+        universe = list(dict.fromkeys([*UNIVERSE, *held]))
+        print(f"universe build FAILED ({e}) — falling back to core+held "
+              f"({len(universe)}): {universe}")
+
     with raw_client as raw:
         fd = CachedDataClient(raw)
-        for ticker in UNIVERSE:
+        for ticker in universe:
             views = {}
             for agent in AGENTS:
                 try:
@@ -221,7 +309,10 @@ def main() -> None:
     # the run stayed GREEN, and the book rebalanced for 2 days on the PEAD
     # quant alone. Dead personas must HALT rebalancing and fail the run
     # loudly, not dilute silently into neutral.
-    fail_ratio = llm_failure_ratio(per_ticker)
+    # Gate on the CORE anchors only: credit exhaustion / provider outage kills
+    # the core too (so this still fires), but fresh most-active names that lack
+    # fundamentals must not tip a false HALT now that the universe > the fixed 10.
+    fail_ratio = llm_failure_ratio(per_ticker, gate_tickers=set(UNIVERSE))
     if fail_ratio >= FAIL_THRESHOLD:
         msg = (f"FATAL: {fail_ratio:.0%} of committee signals are LLM/agent "
                "failures — refusing to rebalance on a dead committee. "
@@ -251,11 +342,8 @@ def main() -> None:
                    for t, views in per_ticker.items() if t not in excluded}
     targets = target_weights(convictions)
 
-    from bridge.alpaca import AlpacaPaper
-    broker = AlpacaPaper()
-    acct = broker.account()
-    equity = float(acct["equity"])
-    current_mv = broker.positions()
+    # broker + current_mv already built above for the universe; reuse them.
+    equity = float(broker.account()["equity"])
     orders = rebalance_orders(targets, current_mv, equity, excluded=frozenset(excluded))
 
     print(f"\nequity=${equity:,.0f} targets={ {t: round(w,3) for t,w in targets.items()} }")
