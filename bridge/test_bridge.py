@@ -96,6 +96,43 @@ def test_build_universe_never_orphans_a_held_name():
     assert "ZZZ" in u and "MSFT" in u  # held kept even with no fresh candidates
 
 
+def test_build_universe_drops_an_option_leg_held_by_the_hedge_sleeve():
+    # 2026-08-05. The daily email carried this line every day:
+    #   "excluded (dead committee, held as-is): XSP260904P00726000 100% failed"
+    # XSP260904P00726000 is the index-hedge sleeve's put. `held` comes from
+    # broker.positions(), which returns options alongside equities, so an OSI
+    # leg reached a committee of stock pickers that cannot value an option.
+    # All 8 abstained, the ratio hit 1.0, and a real committee outage would
+    # have looked identical to this. A red that fires every day trains the eye
+    # to ignore red.
+    from bridge.run_daily import build_universe
+    u = build_universe(["AAPL"], ["LLY", "XSP260904P00726000"], [])
+    assert u == ["AAPL", "LLY"]
+
+
+def test_build_universe_keeps_a_ticker_that_merely_looks_option_ish():
+    # The filter must key on the OSI shape, not on length or digits. A real
+    # equity ticker never carries a 6-digit date + right + 8-digit strike.
+    from bridge.run_daily import build_universe
+    u = build_universe([], ["BRK.B", "GOOGL", "PBR.A"], [])
+    assert u == ["BRK.B", "GOOGL", "PBR.A"]
+
+
+def test_rebalance_never_emits_an_order_against_an_option_symbol():
+    # Defense in depth. Exclusion is what stops the picks rebalancer from
+    # trading the hedge leg today, and exclusion is a side effect of every
+    # persona abstaining — not a rule. Once the leg leaves the universe it is
+    # no longer excluded, so `current_mv` alone would make it sellable: a
+    # notional equity sell against an OSI symbol, on a leg another sleeve owns.
+    from bridge.run_daily import rebalance_orders
+    orders = rebalance_orders(
+        targets={"AAPL": 0.10},
+        current_mv={"AAPL": 5_000.0, "XSP260904P00726000": 1_240.0},
+        equity=100_000.0,
+    )
+    assert [o["symbol"] for o in orders] == ["AAPL"]
+
+
 def test_llm_failure_ratio_gate_restricts_to_core_tickers():
     # A fresh name with no fundamentals goes dead; it must NOT trip the global
     # dead-committee HALT gate — that gate detects credit/provider death, which

@@ -84,10 +84,16 @@ def rebalance_orders(
 
     `excluded` tickers (dead committee — see ticker_failure_ratios) are held
     exactly as-is: no buy, no sell, regardless of target or current value.
-    A data outage is not a reason to force-close a position."""
+    A data outage is not a reason to force-close a position.
+
+    Option legs are skipped outright. They belong to the index-hedge sleeve,
+    which opens and closes them itself, and an order here would be a notional
+    equity order against a contract symbol."""
+    from bridge.index_hedge import is_occ_symbol
+
     orders = []
     for symbol in sorted(set(targets) | set(current_mv)):
-        if symbol in excluded:
+        if symbol in excluded or is_occ_symbol(symbol):
             continue
         want = targets.get(symbol, 0.0) * equity
         have = current_mv.get(symbol, 0.0)
@@ -181,7 +187,17 @@ def build_universe(core: list[str], held: list[str],
     core first, then held-not-core, then fresh. Pure fn.
 
     fresh: (symbol, price) pairs, most-active first. A None or sub-floor price
-    drops the name (illiquid/penny noise the committee shouldn't chase)."""
+    drops the name (illiquid/penny noise the committee shouldn't chase).
+
+    Option legs are dropped from `held`. They arrive because broker.positions()
+    returns every position, and the index-hedge sleeve owns puts. A committee of
+    stock pickers cannot value a contract, so every persona abstained on
+    XSP260904P00726000 and the daily email printed a 100%-failed committee for
+    two weeks — a red that fires every day for a healthy system, which is how a
+    real outage gets missed."""
+    from bridge.index_hedge import is_occ_symbol
+
+    held = [s for s in held if not is_occ_symbol(s)]
     seen = set(core) | set(held)
     picked: list[str] = []
     for sym, price in fresh:

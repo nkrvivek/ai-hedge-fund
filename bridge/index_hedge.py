@@ -38,6 +38,17 @@ def net_conviction(convictions: dict[str, float]) -> float:
     return sum(convictions.values()) if convictions else 0.0
 
 
+def is_occ_symbol(symbol: str) -> bool:
+    """True for an OSI option symbol, false for an equity ticker.
+
+    The broker returns options and equities in one positions map, so any caller
+    that treats a position list as a list of stocks needs this to tell them
+    apart. Keyed on the OSI shape — root, 6-digit date, right, 8-digit strike —
+    so a dotted class ticker like BRK.B is never mistaken for a contract.
+    """
+    return bool(_OCC_RE.match(symbol.strip()))
+
+
 def parse_occ(symbol: str) -> tuple[str, date, str, float]:
     """OCC compact symbol -> (root, expiry, right, strike)."""
     m = _OCC_RE.match(symbol.strip())
