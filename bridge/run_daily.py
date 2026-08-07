@@ -455,6 +455,17 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 — never break a run on the ledger
             print(f"trade ledger FAILED (non-fatal): {e}")
 
+    # Score the committee's own past calls (learning.py). Reads the ledger we
+    # just appended to, so it always sees today's row; nothing is applied
+    # automatically. Runs on dry runs too — it scores history, not today.
+    try:
+        from bridge.learning import run_learning
+        lrow = run_learning(broker, asof, LEDGER)
+        print(f"learning: {lrow['n_scored']} pick(s) scored across "
+              f"{lrow['n_matured']} matured day(s), hit rate {lrow['hit_rate']}")
+    except Exception as e:  # noqa: BLE001 — scoring must never break the book
+        print(f"learning FAILED (non-fatal): {e}")
+
     _send_daily_email(asof=asof, equity=equity, convictions=convictions,
                       targets=targets, placed=placed if placed else orders,
                       fail_ratio=fail_ratio, dry_run=args.dry_run,

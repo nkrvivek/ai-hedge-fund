@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from bridge.run_daily import (
     buy_order_body,
     composite,
@@ -292,3 +296,108 @@ def test_ticker_failure_ratios_isolates_a_single_dead_ticker():
     }
     ratios = ticker_failure_ratios(per_ticker)
     assert ratios == {"LLY": 1.0, "AAPL": 0.0}
+
+
+# --- daily_closes: batched history for the learning loop ---------------------
+
+
+class _FakeResp:
+    def __init__(self, payload, ok=True, status=200, text=""):
+        self._payload, self.ok, self.status_code = payload, ok, status
+        self.text = text or json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """Replays a queue of responses and records every request."""
+
+    def __init__(self, responses):
+        self._queue, self.calls = list(responses), []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, dict(params or {})))
+        return self._queue.pop(0)
+
+
+def _client_with(session):
+    from bridge.alpaca import AlpacaPaper
+
+    client = AlpacaPaper.__new__(AlpacaPaper)  # skip env/endpoint checks
+    client.session = session
+    return client
+
+
+def _bar(day, close):
+    return {"t": f"{day}T04:00:00Z", "c": close}
+
+
+def test_daily_closes_keys_each_close_by_its_session_date():
+    session = _FakeSession([_FakeResp(
+        {"bars": {"MU": [_bar("2026-07-27", 100.0), _bar("2026-07-28", 101.5)]}})])
+
+    out = _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01")
+
+    assert out == {"MU": {"2026-07-27": 100.0, "2026-07-28": 101.5}}
+
+
+def test_daily_closes_asks_for_split_adjusted_daily_bars():
+    """Unadjusted, a 2-for-1 split inside the window reads as a 50% drop."""
+    session = _FakeSession([_FakeResp({"bars": {}})])
+
+    _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01")
+
+    _, params = session.calls[0]
+    assert params["adjustment"] == "all"
+    assert params["timeframe"] == "1Day"
+    assert params["symbols"] == "MU"
+
+
+def test_daily_closes_follows_pagination_and_merges_the_pages():
+    session = _FakeSession([
+        _FakeResp({"bars": {"MU": [_bar("2026-07-27", 100.0)]},
+                   "next_page_token": "p2"}),
+        _FakeResp({"bars": {"MU": [_bar("2026-07-28", 101.0)]}}),
+    ])
+
+    out = _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01")
+
+    assert out["MU"] == {"2026-07-27": 100.0, "2026-07-28": 101.0}
+    assert session.calls[1][1]["page_token"] == "p2"
+
+
+def test_daily_closes_raises_rather_than_returning_a_silent_empty():
+    from bridge.alpaca import AlpacaPaperError
+
+    session = _FakeSession([_FakeResp({}, ok=False, status=429, text="slow down")])
+
+    with pytest.raises(AlpacaPaperError):
+        _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01")
+
+
+def test_daily_closes_asks_for_nothing_when_no_name_was_called():
+    session = _FakeSession([])
+
+    assert _client_with(session).daily_closes([], "2026-07-27", "2026-08-01") == {}
+    assert session.calls == []
+
+
+def test_daily_closes_refuses_to_page_forever():
+    from bridge.alpaca import AlpacaPaperError
+
+    session = _FakeSession([_FakeResp({"bars": {}, "next_page_token": "p"})] * 3)
+
+    with pytest.raises(AlpacaPaperError):
+        _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01",
+                                           page_limit=3)
+
+
+def test_daily_closes_pins_the_feed_the_key_can_actually_read():
+    """A SIP request reaching the last 15 minutes 403s on this plan, and the
+    403 costs the whole window — one live run scored 0 of 98 picks."""
+    session = _FakeSession([_FakeResp({"bars": {}})])
+
+    _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01")
+
+    assert session.calls[0][1]["feed"] == "iex"

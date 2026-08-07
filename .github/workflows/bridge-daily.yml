@@ -38,5 +38,5 @@ jobs:
       - name: commit ledger
         run: |
           git config user.name "bridge-bot" && git config user.email "bridge@local"
-          git add bridge/ledger.jsonl || true
+          git add bridge/ledger.jsonl bridge/learning_log.jsonl || true
           git diff --cached --quiet || git commit -m "ledger: $(date -u +%F)" && git push || true

@@ -157,6 +157,52 @@ class AlpacaPaper:
             out[sym] = (float(price), float(price) / float(prev) - 1.0)
         return out
 
+    def daily_closes(self, symbols: list[str], start: str, end: str,
+                     page_limit: int = 20,
+                     feed: str = "iex") -> dict[str, dict[str, float]]:
+        """{symbol: {YYYY-MM-DD: close}} over [start, end], one batched call.
+
+        Feeds the learning loop, which scores a day's convictions against what
+        the names did over the following week. Batched on purpose: a per-name
+        quote call under a budget is how the autopilot book's scorer spent its
+        whole cap on rows that could never score (fixed 2026-08-07).
+
+        The feed is pinned to IEX. This key's plan refuses SIP bars that reach
+        into the last 15 minutes — `403 subscription does not permit querying
+        recent SIP data` — and that refusal costs the whole request, not the
+        recent part of it, so one live run scored 0 of 98 picks. IEX closes run
+        a few cents off the consolidated close (MU 899.92 against 900.20 on
+        2026-07-27); the loop scores which way a name moved over a week, and
+        cents do not change that.
+
+        `adjustment=all` so a split inside the window does not read as a 50%
+        move. Raises on API failure — the caller decides whether an unscored
+        week is acceptable, and a silent empty result would look like a book
+        with nothing to say."""
+        if not symbols:
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        params = {"symbols": ",".join(symbols), "timeframe": "1Day",
+                  "start": start, "end": end, "adjustment": "all",
+                  "feed": feed, "limit": 10000}
+        for _ in range(page_limit):
+            resp = self.session.get("https://data.alpaca.markets/v2/stocks/bars",
+                                    params=params, timeout=30)
+            if not resp.ok:
+                raise AlpacaPaperError(f"bars {resp.status_code}: {resp.text[:200]}")
+            body = resp.json() or {}
+            for sym, bars in (body.get("bars") or {}).items():
+                series = out.setdefault(sym, {})
+                for bar in bars or []:
+                    day, close = bar.get("t"), bar.get("c")
+                    if day and close is not None:
+                        series[day[:10]] = float(close)
+            token = body.get("next_page_token")
+            if not token:
+                return out
+            params["page_token"] = token
+        raise AlpacaPaperError(f"bars: more than {page_limit} pages for {start}..{end}")
+
     def latest_price(self, symbol: str) -> float | None:
         """Best-effort last trade price via the data API (paper key works)."""
         try:
