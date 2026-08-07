@@ -36,7 +36,21 @@ jobs:
           RESEND_TO: ${{ secrets.RESEND_TO }}
         run: poetry run python -m bridge.run_daily
       - name: commit ledger
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          # The 08-06 row landed on main because a failed run was re-dispatched
+          # by hand from that branch, and this step commits to whatever ref
+          # triggered it. The book and the scorer read the ledger on their own
+          # branch, so the day was invisible to both and nothing said so. Fail
+          # here instead: the trading run above has already finished and sent
+          # its digest, and a red bookkeeping step is the signal that a day's
+          # row needs moving.
+          if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "refusing to write the ledger on '$GITHUB_REF_NAME' —" \
+                 "it belongs on '$DEFAULT_BRANCH'. Re-dispatch there."
+            exit 1
+          fi
           git config user.name "bridge-bot" && git config user.email "bridge@local"
           git add bridge/ledger.jsonl bridge/learning_log.jsonl || true
           git diff --cached --quiet || git commit -m "ledger: $(date -u +%F)" && git push || true
