@@ -10,8 +10,10 @@ Usage:
     poetry run python -m bridge.run_daily --dry-run  # decide, print, no orders
 
 Quarantine: bridge/alpaca.py refuses non-paper endpoints. This experiment is
-isolated from the autopilot books entirely (user directive 2026-07-10;
-eval 2026-08-10 before any fold-in).
+isolated from the autopilot books entirely (user directive 2026-07-10).
+Month-1 eval 2026-08-10: −2.64% vs SPY +2.43%, hit rate 45.9% — extended to
+2026-09-10 ON PROBATION (DJ-20260810-05): committee-health gate + churn cap
+below, and the hit rate must clear 0.50 by the review or the book dies.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ MAX_WEIGHT = 0.10          # per-name cap, long or short
 GROSS_CAP = 1.0            # total |weights| <= 100% of equity
 MIN_TRADE_USD = 200        # ignore rebalance dust
 FAIL_THRESHOLD = 0.5       # committee failure ratio that halts a run (global) or excludes a ticker
+CHURN_CAP = 0.25           # probation (DJ-20260810-05): max fraction of equity turned per day
 LEDGER = Path(__file__).parent / "ledger.jsonl"
 
 
@@ -103,6 +106,37 @@ def rebalance_orders(
         orders.append({"symbol": symbol, "delta_usd": round(delta, 2),
                        "side": "buy" if delta > 0 else "sell"})
     return orders
+
+
+def probation_no_trade_reason(fail_ratio: float) -> str | None:
+    """Probation condition 1 (DJ-20260810-05, extension to 2026-09-10): ANY
+    committee failure on the core anchors blocks all trading for the day.
+    Signals still run, the ledger is still written, the email still goes out.
+    Stricter than the FATAL gate above (which needs FAIL_THRESHOLD): month 1
+    traded through a 2%-failed day and the 7/16-17 dead committee. Pure fn."""
+    if fail_ratio > 0.0:
+        return (f"probation gate: {fail_ratio:.0%} committee signals failed — "
+                "no trades today (DJ-20260810-05)")
+    return None
+
+
+def cap_churn(orders: list[dict], equity: float,
+              cap: float = CHURN_CAP) -> tuple[list[dict], float]:
+    """Probation condition 2 (DJ-20260810-05): total |delta_usd| per day may
+    not exceed cap*equity. Over-cap sets scale ALL deltas proportionally —
+    same direction, partial move toward target — never reorder or cherry-pick.
+    Post-scale dust under MIN_TRADE_USD is dropped. Pure fn; returns a new
+    list and the applied scale (1.0 = untouched). Month 1 turned 72% of the
+    book in one morning on overnight conviction whiplash; this makes that
+    day take three."""
+    total = sum(abs(o["delta_usd"]) for o in orders)
+    limit = cap * equity
+    if not orders or total <= limit:
+        return orders, 1.0
+    scale = limit / total
+    scaled = [{**o, "delta_usd": round(o["delta_usd"] * scale, 2)}
+              for o in orders]
+    return [o for o in scaled if abs(o["delta_usd"]) >= MIN_TRADE_USD], scale
 
 
 def buy_order_body(delta_usd: float, price: float | None) -> dict:
@@ -361,12 +395,20 @@ def main() -> None:
     # broker + current_mv already built above for the universe; reuse them.
     equity = float(broker.account()["equity"])
     orders = rebalance_orders(targets, current_mv, equity, excluded=frozenset(excluded))
+    orders, churn_scale = cap_churn(orders, equity)
+    if churn_scale < 1.0:
+        print(f"churn cap: staged turnover scaled by {churn_scale:.2f} "
+              f"to {CHURN_CAP:.0%} of equity (DJ-20260810-05)")
+
+    probation = probation_no_trade_reason(fail_ratio)
+    if probation:
+        print(probation)
 
     print(f"\nequity=${equity:,.0f} targets={ {t: round(w,3) for t,w in targets.items()} }")
     print(f"orders ({len(orders)}): {orders}")
 
     placed = []
-    if not args.dry_run:
+    if not args.dry_run and not probation:
         for o in orders:
             try:
                 if o["side"] == "sell":
@@ -415,7 +457,7 @@ def main() -> None:
     # attribution sleeve="index_hedge" keeps the 8/10 eval clean.
     from bridge.index_hedge import run_index_hedge
     hedge = run_index_hedge(broker, convictions=convictions, equity=equity,
-                            dry_run=args.dry_run)
+                            dry_run=args.dry_run or bool(probation))
     print(f"index_hedge: {hedge.get('action')} — {hedge.get('reason', '')}")
 
     with LEDGER.open("a") as f:
@@ -428,6 +470,8 @@ def main() -> None:
             "long_only": True,
             "index_hedge": hedge,
             "dry_run": args.dry_run,
+            "probation_no_trade": probation,
+            "churn_scale": churn_scale,
         }) + "\n")
     print(f"\nledger appended -> {LEDGER}")
 
@@ -469,7 +513,7 @@ def main() -> None:
     _send_daily_email(asof=asof, equity=equity, convictions=convictions,
                       targets=targets, placed=placed if placed else orders,
                       fail_ratio=fail_ratio, dry_run=args.dry_run,
-                      excluded=excluded, hedge=hedge)
+                      excluded=excluded, hedge=hedge, probation=probation)
 
 
 def _hedge_email_line(hedge: dict | None) -> str:
@@ -494,7 +538,8 @@ def _send_daily_email(*, asof: str, equity: float, convictions: dict,
                       targets: dict, placed: list, fail_ratio: float,
                       dry_run: bool, excluded: dict[str, float] | None = None,
                       halt_reason: str | None = None,
-                      hedge: dict | None = None) -> None:
+                      hedge: dict | None = None,
+                      probation: str | None = None) -> None:
     """Daily digest via Resend (2026-07-17 user directive: 'I'm not getting
     any email for AI hedge fund, enable that'). Best-effort — an email
     failure never fails the run. Requires RESEND_API_KEY/FROM/TO env
@@ -539,6 +584,8 @@ def _send_daily_email(*, asof: str, equity: float, convictions: dict,
             health = f"🟡 {fail_ratio:.0%} committee signals failed"
         else:
             health = "🟢 committee healthy"
+        if probation:
+            health = f"🟠 {probation} · {health}"
         html = (
             f"<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>"
             f"<h3 style='margin:0 0 8px'>[ai-hedge-fund] {asof} — equity ${equity:,.0f}"
