@@ -23,6 +23,23 @@ class LLMParseError(ValueError):
     """The model's response did not contain parseable JSON."""
 
 
+class LLMTruncatedError(LLMParseError):
+    """The model never finished the object — it ran into the token cap, or
+    came back empty. Distinct from LLMParseError because the remedy is
+    different: a truncated response is a cap problem, not a prompt problem,
+    and reading one as the other cost a trading day on 2026-08-11."""
+
+
+# Appended to the user prompt on the second attempt. The personas already
+# ask for 2-4 sentences; a response that overran the cap is one ignoring
+# that, so the retry narrows it rather than repeating the same request.
+RETRY_SUFFIX = (
+    "\n\nYour previous answer did not finish. Reply with the JSON object "
+    "alone — no preamble, no code fence — and keep `reasoning` to one "
+    "sentence."
+)
+
+
 @runtime_checkable
 class LLMClient(Protocol):
     """Protocol all LLM providers must satisfy.
@@ -45,7 +62,10 @@ class AnthropicLLM:
         self,
         model: str | None = None,
         timeout: float = 60.0,
-        max_tokens: int = 1024,
+        # 1024 was not enough headroom for a persona that runs past the
+        # 2-4 sentences its prompt asks for: seven of ~170 calls came back
+        # unfinished on 2026-08-11. The retry above covers the rest.
+        max_tokens: int = 2048,
     ) -> None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -64,6 +84,22 @@ class AnthropicLLM:
         )
 
     def complete(self, system: str, user: str) -> str:
+        text = self._invoke(system, user)
+        if text is not None:
+            return text
+        # Cut off, or empty. Ask once more for the JSON alone before giving
+        # up — on 2026-08-11 seven personas hit this and each abstention
+        # counted toward the probation gate that blocked the whole day.
+        text = self._invoke(system, user + RETRY_SUFFIX)
+        if text is None:
+            raise LLMTruncatedError(
+                f"{self.model} did not finish the response twice "
+                "(stop_reason max_tokens, or an empty body)"
+            )
+        return text
+
+    def _invoke(self, system: str, user: str) -> str | None:
+        """One call. Returns the text, or None when it did not finish."""
         result = self._chat.invoke([("system", system), ("human", user)])
         content = result.content
         # Anthropic reasoning models return a list of content blocks.
@@ -72,6 +108,9 @@ class AnthropicLLM:
                 block.get("text", "") if isinstance(block, dict) else str(block)
                 for block in content
             )
+        stop_reason = getattr(result, "response_metadata", {}).get("stop_reason")
+        if stop_reason == "max_tokens" or not content.strip():
+            return None
         return content
 
 
