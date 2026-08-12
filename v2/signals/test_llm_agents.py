@@ -184,3 +184,84 @@ def test_extract_json_embedded():
 def test_extract_json_raises_on_garbage():
     with pytest.raises(LLMParseError):
         extract_json("no json here at all")
+
+
+# ---------------------------------------------------------------------------
+# Truncated-response retry (2026-08-12)
+#
+# `stop_reason` did not identify the cut-off responses that blocked trading on
+# 2026-08-11 and 2026-08-12, so the client's own retry never fired. The agent
+# sees the parse, so the agent is where the second ask belongs.
+# ---------------------------------------------------------------------------
+
+CUT = '{"signal": "bullish", "confidence": 74, "reasoning": "Meta is a wonderful bus'
+
+
+class SequenceLLM:
+    """Returns each queued response in turn; records the prompts it got."""
+
+    model = "fake-model"
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.prompts = []
+
+    def complete(self, system, user):
+        self.prompts.append(user)
+        return self._responses.pop(0)
+
+
+def test_a_truncated_response_is_asked_again_instead_of_abstaining(tmp_path):
+    # Arrange
+    llm = SequenceLLM([CUT, BULLISH])
+    agent = _agent(tmp_path, llm)
+
+    # Act
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    # Assert
+    assert sig.metadata["abstained"] is False
+    assert sig.value == 0.8
+    assert len(llm.prompts) == 2
+
+
+def test_the_second_ask_tells_the_model_its_answer_was_cut_off(tmp_path):
+    # Arrange
+    llm = SequenceLLM([CUT, BULLISH])
+    agent = _agent(tmp_path, llm)
+
+    # Act
+    agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    # Assert
+    assert "did not finish" in llm.prompts[1]
+    assert llm.prompts[1].startswith(llm.prompts[0])
+
+
+def test_abstains_when_the_second_response_is_also_truncated(tmp_path):
+    # Arrange
+    llm = SequenceLLM([CUT, CUT])
+    agent = _agent(tmp_path, llm)
+
+    # Act
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    # Assert
+    assert sig.metadata["abstained"] is True
+    assert "unclosed" in sig.metadata["abstain_reason"]
+    assert len(llm.prompts) == 2
+
+
+def test_a_plain_parse_failure_is_not_retried(tmp_path):
+    # Prose with no object at all is a prompt problem; asking twice just costs
+    # a second call.
+    # Arrange
+    llm = SequenceLLM(["I am bullish, trust me.", BULLISH])
+    agent = _agent(tmp_path, llm)
+
+    # Act
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    # Assert
+    assert sig.metadata["abstained"] is True
+    assert len(llm.prompts) == 1

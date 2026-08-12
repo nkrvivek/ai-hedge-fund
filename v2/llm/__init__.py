@@ -3,6 +3,7 @@
 from v2.llm.cache import PromptCache, prompt_key
 from v2.llm.client import (
     DEFAULT_MODEL,
+    RETRY_SUFFIX,
     AnthropicLLM,
     LLMClient,
     LLMParseError,
@@ -13,6 +14,7 @@ from v2.llm.client import (
 __all__ = [
     "AnthropicLLM",
     "DEFAULT_MODEL",
+    "RETRY_SUFFIX",
     "LLMClient",
     "LLMParseError",
     "LLMTruncatedError",

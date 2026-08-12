@@ -12,11 +12,20 @@ workaround). We ask for JSON in the prompt and parse it ourselves.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Protocol, runtime_checkable
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MODEL = "claude-sonnet-5"
+
+# Anthropic's ordinary endings. `max_tokens` is handled above as a failure;
+# anything outside this set is unexpected and gets logged. A provider that
+# reports nothing at all (None) counts as normal — the 2026-08-11 fix already
+# established that a missing stop_reason must not be read as trouble.
+_NORMAL_STOP_REASONS = frozenset({None, "end_turn", "stop_sequence", "tool_use"})
 
 
 class LLMParseError(ValueError):
@@ -111,6 +120,17 @@ class AnthropicLLM:
         stop_reason = getattr(result, "response_metadata", {}).get("stop_reason")
         if stop_reason == "max_tokens" or not content.strip():
             return None
+        if stop_reason not in _NORMAL_STOP_REASONS:
+            # Not a failure — the text is usable, so return it. But write the
+            # value down: on 2026-08-12 five responses arrived cut off mid-object
+            # and none of them said max_tokens, so what Anthropic reports on
+            # those calls is unknown and this line is how we find out. Length
+            # goes with it — it is what separates hitting the cap from
+            # stopping short of it.
+            logger.warning(
+                "%s finished with stop_reason=%r (%d chars)",
+                self.model, stop_reason, len(content),
+            )
         return content
 
 
@@ -134,16 +154,55 @@ def extract_json(text: str) -> dict:
 
     start = text.find("{")
     if start != -1:
-        depth = 0
-        for i, ch in enumerate(text[start:], start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start : i + 1])
-                    except json.JSONDecodeError:
-                        break
+        end = _end_of_first_object(text, start)
+        if end is not None:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        else:
+            # An opening brace that never closes: the response stopped
+            # mid-object. Say so, because the remedy is to ask again rather
+            # than to rewrite the prompt. On 2026-08-12 five personas hit
+            # this and `stop_reason` reported a normal finish for every one,
+            # so the text is the only reliable witness. The length goes in
+            # the message: it is what tells a postmortem whether the model
+            # ran into the token cap or stopped short of it.
+            raise LLMTruncatedError(
+                f"response stopped inside an unclosed JSON object "
+                f"({len(text)} chars): {text[:200]!r}"
+            )
 
     raise LLMParseError(f"no JSON object found in response: {text[:200]!r}")
+
+
+def _end_of_first_object(text: str, start: int) -> int | None:
+    """Index of the `}` closing the object that opens at `start`, or None if
+    it never closes.
+
+    Counts braces outside string literals only. A persona quoting a brace
+    ("guidance was {redacted}") would otherwise skew the depth and read as a
+    truncated response — the opposite error from the one this module already
+    made once.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None

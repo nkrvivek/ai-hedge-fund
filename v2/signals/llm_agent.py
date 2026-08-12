@@ -26,7 +26,15 @@ import logging
 
 from v2.data.protocol import DataClient
 from v2.features.snapshot import FundamentalsSnapshot, InsufficientData, build_snapshot
-from v2.llm import AnthropicLLM, LLMClient, PromptCache, extract_json, prompt_key
+from v2.llm import (
+    RETRY_SUFFIX,
+    AnthropicLLM,
+    LLMClient,
+    LLMTruncatedError,
+    PromptCache,
+    extract_json,
+    prompt_key,
+)
 from v2.models import Signal
 from v2.signals.base import AlphaModel
 
@@ -66,12 +74,6 @@ class LLMAgent(AlphaModel):
         if cached is not None and "parsed" in cached:
             return self._to_signal(ticker, date, cached["parsed"], key, snapshot, cached=True)
 
-        try:
-            response = self._llm.complete(system, user)
-        except Exception as exc:
-            logger.warning("%s LLM call failed for %s@%s: %s", self.name, ticker, date, exc)
-            return self._abstain(ticker, date, f"LLM call failed: {exc}")
-
         record = {
             "agent": self.name,
             "model": self._llm.model,
@@ -80,19 +82,45 @@ class LLMAgent(AlphaModel):
             "snapshot_hash": snapshot.content_hash,
             "system": system,
             "user": user,
-            "response": response,
         }
 
-        try:
-            parsed = self._parse(response)
-        except Exception as exc:
-            # Persist the raw response even when unparseable — the debug trail.
-            self._cache.put(key, {**record, "parse_error": str(exc)})
-            logger.warning("%s parse failed for %s@%s: %s", self.name, ticker, date, exc)
-            return self._abstain(ticker, date, f"parse failed: {exc}")
+        # A truncated answer is not a judgment the persona made — it is an
+        # answer that never arrived, so ask once more before giving up. The
+        # client already retries what `stop_reason` flags; on 2026-08-11 and
+        # 2026-08-12 every cut-off response came back flagged as a normal
+        # finish, so the parse is the only place that sees the problem. Each
+        # abstention costs the whole trading day under the probation gate
+        # (DJ-20260810-05), which trips on any committee failure at all.
+        #
+        # Prose with no object at all is NOT retried: that is the prompt
+        # failing, and asking again the same way just spends another call.
+        for prompt in (user, user + RETRY_SUFFIX):
+            try:
+                response = self._llm.complete(system, prompt)
+            except Exception as exc:
+                logger.warning("%s LLM call failed for %s@%s: %s", self.name, ticker, date, exc)
+                return self._abstain(ticker, date, f"LLM call failed: {exc}")
 
-        self._cache.put(key, {**record, "parsed": parsed})
-        return self._to_signal(ticker, date, parsed, key, snapshot, cached=False)
+            try:
+                parsed = self._parse(response)
+            except LLMTruncatedError as exc:
+                failure, retryable = exc, True
+            except Exception as exc:
+                failure, retryable = exc, False
+            else:
+                self._cache.put(key, {**record, "response": response, "parsed": parsed})
+                return self._to_signal(ticker, date, parsed, key, snapshot, cached=False)
+
+            # Persist the raw response even when unparseable — the debug trail.
+            self._cache.put(key, {**record, "response": response, "parse_error": str(failure)})
+            logger.warning(
+                "%s parse failed for %s@%s (%d chars): %s",
+                self.name, ticker, date, len(response), failure,
+            )
+            if not retryable:
+                break
+
+        return self._abstain(ticker, date, f"parse failed: {failure}")
 
     # ------------------------------------------------------------------
     # Subclass surface
