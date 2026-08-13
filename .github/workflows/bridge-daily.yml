@@ -29,6 +29,12 @@ jobs:
           ALPACA_TRADING_ENDPOINT: https://paper-api.alpaca.markets/v2
           UW_TOKEN: ${{ secrets.UW_TOKEN }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          # The shared watch list (2026-08-13), read over the trade-refresh
+          # worker's token-gated /watchlist route. Read-only by construction:
+          # this repo holds no R2 credential, so it can never write the bucket
+          # the other four books share.
+          TR_WORKER_URL: ${{ secrets.TR_WORKER_URL }}
+          TR_WORKER_TOKEN: ${{ secrets.TR_WORKER_TOKEN }}
           # 2026-07-17: daily digest email (secrets exist but were unmapped —
           # GH only exposes secrets explicitly listed here).
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}

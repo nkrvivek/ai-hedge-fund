@@ -323,9 +323,28 @@ def main() -> None:
     broker = AlpacaPaper()
     current_mv = broker.positions()
     held = list(current_mv.keys())
+
+    # The shared watch list — one list across all five books, composed daily by
+    # trade-refresh's cron. It widens the CANDIDATE POOL, not the core anchors:
+    # build_universe still takes only its top k_fresh movers, so the committee
+    # scores the same number of names it scored yesterday and the daily LLM
+    # spend does not move. bridge/shared_watchlist.py has the full reason the
+    # pool is the right door and UNIVERSE is the wrong one.
     try:
-        snaps = broker.snapshot_movers(THEME_POOL)
-        fresh = rank_movers(THEME_POOL, snaps)
+        from bridge.shared_watchlist import read_shared_watchlist
+
+        shared = read_shared_watchlist(THEME_POOL)
+        pool = list(shared.tickers)
+        print(f"theme pool ({len(pool)}): curated {len(THEME_POOL)} + {shared.detail}")
+        if shared.stale or shared.source == "fallback":
+            print(f"WARNING: shared watch list degraded - {shared.detail}")
+    except Exception as e:  # noqa: BLE001 — a watch list must not cost us the run
+        pool = list(THEME_POOL)
+        print(f"theme pool: shared watch list read FAILED ({e}) — curated pool only")
+
+    try:
+        snaps = broker.snapshot_movers(pool)
+        fresh = rank_movers(pool, snaps)
         universe = build_universe(list(UNIVERSE), held, fresh)
         added = [s for s in universe if s not in set(UNIVERSE) | set(held)]
         print(f"universe ({len(universe)}): core {len(UNIVERSE)} + held {len(held)} "
