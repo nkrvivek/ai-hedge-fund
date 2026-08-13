@@ -67,6 +67,7 @@ STALE_AFTER_HOURS = 40
 MAX_ADDED = 250
 
 HTTP_TIMEOUT_SECONDS = 15
+USER_AGENT = "ai-hedge-fund-bridge/1.0"
 
 
 @dataclass(frozen=True)
@@ -103,7 +104,12 @@ def _fallback(floor: Iterable[str], detail: str) -> SharedWatchlist:
 
 
 def _http_get(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+    # The User-Agent is not decoration. urllib's default ("Python-urllib/3.x")
+    # is answered with 403 Forbidden at the Cloudflare edge before the worker
+    # ever sees the request, and the same URL under curl returns 200. Named
+    # here so the next person reading a 403 does not go looking at the token.
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
         return resp.read().decode("utf-8")
 
 

@@ -230,6 +230,45 @@ def test_the_token_travels_in_the_query_string_the_worker_expects():
     assert seen == ["https://w.example/watchlist?token=sekrit"]
 
 
+def test_the_default_fetcher_sends_a_named_user_agent():
+    # Found in live verification 2026-08-13: urllib's default UA
+    # ("Python-urllib/3.x") is answered 403 Forbidden at the Cloudflare edge
+    # before the worker sees the request, while the same URL under curl
+    # returns 200. The failure reads as a bad token and is not one.
+    # Arrange
+    import urllib.request
+
+    from bridge import shared_watchlist as sw
+
+    captured: list[urllib.request.Request] = []
+
+    class _Resp:
+        def read(self) -> bytes:
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a) -> None:
+            return None
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _Resp()
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        # Act
+        sw._http_get("https://w.example/watchlist?token=x")
+    finally:
+        urllib.request.urlopen = original
+
+    # Assert
+    assert captured[0].get_header("User-agent") == sw.USER_AGENT
+    assert "urllib" not in captured[0].get_header("User-agent").lower()
+
+
 def test_the_result_is_immutable():
     # Act
     read = read_shared_watchlist(FLOOR, fetch=_fetcher(_payload(["NVDA"])), now=NOW)
