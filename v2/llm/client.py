@@ -39,13 +39,32 @@ class LLMTruncatedError(LLMParseError):
     and reading one as the other cost a trading day on 2026-08-11."""
 
 
+class LLMMalformedError(LLMParseError):
+    """The object arrived whole and the decoder still refused it: a raw
+    newline inside a string, an unescaped quote, a trailing comma.
+
+    Separate from LLMParseError for the same reason LLMTruncatedError is.
+    A response with no object at all is the prompt failing, and asking
+    again the same way just spends another call. A malformed object is a
+    sampling accident, and asking again gets valid JSON. Until 2026-08-17
+    this case fell through to `no JSON object found in response`, which is
+    both false — the object is right there in the message it prints — and
+    non-retryable, so the persona abstained on the first attempt. Measured
+    on AMAT, 2026-08-14: one abstention, and under the probation gate
+    (DJ-20260810-05) one abstention costs the whole trading day.
+    """
+
+
 # Appended to the user prompt on the second attempt. The personas already
 # ask for 2-4 sentences; a response that overran the cap is one ignoring
 # that, so the retry narrows it rather than repeating the same request.
+# The wording has to cover both retryable failures without asserting
+# either: a truncated answer did not finish, a malformed one finished and
+# would not parse, and the retry cannot tell the model which it sent.
 RETRY_SUFFIX = (
-    "\n\nYour previous answer did not finish. Reply with the JSON object "
-    "alone — no preamble, no code fence — and keep `reasoning` to one "
-    "sentence."
+    "\n\nYour previous answer could not be read as JSON. Reply with the "
+    "JSON object alone, no preamble and no code fence, keep `reasoning` to "
+    "one sentence, and escape any quote or newline inside a string."
 )
 
 
@@ -158,8 +177,18 @@ def extract_json(text: str) -> dict:
         if end is not None:
             try:
                 return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                # A whole object the decoder still refused. Say which of the
+                # two it is, because the old fall-through raised "no JSON
+                # object found" over a message that plainly showed one, and
+                # a postmortem reading that line goes looking at the prompt.
+                # The decoder's own complaint names the character and the
+                # position; the length is what tells a reader whether the
+                # response was also near the cap.
+                raise LLMMalformedError(
+                    f"response held a complete JSON object that would not "
+                    f"parse ({len(text)} chars): {exc}: {text[:200]!r}"
+                ) from exc
         else:
             # An opening brace that never closes: the response stopped
             # mid-object. Say so, because the remedy is to ask again rather

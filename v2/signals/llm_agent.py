@@ -30,6 +30,7 @@ from v2.llm import (
     RETRY_SUFFIX,
     AnthropicLLM,
     LLMClient,
+    LLMMalformedError,
     LLMTruncatedError,
     PromptCache,
     extract_json,
@@ -92,6 +93,11 @@ class LLMAgent(AlphaModel):
         # abstention costs the whole trading day under the probation gate
         # (DJ-20260810-05), which trips on any committee failure at all.
         #
+        # An object that arrived whole and would not decode is retried for
+        # the same reason: a stray newline or quote inside a string is a
+        # sampling accident, not a judgment. AMAT abstained on one on
+        # 2026-08-14, before that case had a name of its own.
+        #
         # Prose with no object at all is NOT retried: that is the prompt
         # failing, and asking again the same way just spends another call.
         for prompt in (user, user + RETRY_SUFFIX):
@@ -103,7 +109,7 @@ class LLMAgent(AlphaModel):
 
             try:
                 parsed = self._parse(response)
-            except LLMTruncatedError as exc:
+            except (LLMTruncatedError, LLMMalformedError) as exc:
                 failure, retryable = exc, True
             except Exception as exc:
                 failure, retryable = exc, False

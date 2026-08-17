@@ -12,6 +12,7 @@ import pytest
 
 from v2.llm.client import (
     AnthropicLLM,
+    LLMMalformedError,
     LLMParseError,
     LLMTruncatedError,
     extract_json,
@@ -174,6 +175,44 @@ def test_prose_with_no_object_at_all_stays_a_plain_parse_error():
     with pytest.raises(LLMParseError) as exc:
         extract_json(prose)
     assert not isinstance(exc.value, LLMTruncatedError)
+    assert not isinstance(exc.value, LLMMalformedError)
+
+
+def test_a_complete_object_the_decoder_refuses_is_malformed_not_missing():
+    # The AMAT abstention of 2026-08-14. The object is whole and the braces
+    # balance; a raw newline inside the string is what json rejects.
+    # Arrange
+    reply = '{"signal": "neutral", "confidence": 45, "reasoning": "AMAT is\nsolid"}'
+
+    # Act / Assert
+    with pytest.raises(LLMMalformedError) as exc:
+        extract_json(reply)
+    assert "no JSON object found" not in str(exc.value)
+
+
+def test_a_malformed_object_is_not_reported_as_truncation():
+    # The two retryable failures have different remedies at the prompt, so
+    # neither may answer to the other's name.
+    # Arrange
+    reply = '{"signal": "bullish", "confidence": 70,}'
+
+    # Act / Assert
+    with pytest.raises(LLMMalformedError) as exc:
+        extract_json(reply)
+    assert not isinstance(exc.value, LLMTruncatedError)
+
+
+def test_the_malformed_message_carries_the_decoder_complaint_and_the_length():
+    # Arrange
+    reply = '{"signal": "bearish", "confidence": 30, "reasoning": "runs "hot""}'
+
+    # Act
+    with pytest.raises(LLMMalformedError) as exc:
+        extract_json(reply)
+
+    # Assert — the position the decoder named, and how long the answer ran
+    assert "char" in str(exc.value)
+    assert f"({len(reply)} chars)" in str(exc.value)
 
 
 def test_the_truncation_message_carries_the_response_length():

@@ -196,6 +196,11 @@ def test_extract_json_raises_on_garbage():
 
 CUT = '{"signal": "bullish", "confidence": 74, "reasoning": "Meta is a wonderful bus'
 
+# The AMAT response of 2026-08-14: whole object, balanced braces, and a raw
+# newline inside the string that json refuses. It abstained on the first
+# attempt because this read as "no JSON object found", which is not retryable.
+MALFORMED = '{"signal": "neutral", "confidence": 45, "reasoning": "AMAT is\nsolid"}'
+
 
 class SequenceLLM:
     """Returns each queued response in turn; records the prompts it got."""
@@ -225,7 +230,9 @@ def test_a_truncated_response_is_asked_again_instead_of_abstaining(tmp_path):
     assert len(llm.prompts) == 2
 
 
-def test_the_second_ask_tells_the_model_its_answer_was_cut_off(tmp_path):
+def test_the_second_ask_keeps_the_original_prompt_and_narrows_the_answer(tmp_path):
+    # The retry cannot tell the model which failure it hit, so it names
+    # neither: a truncated answer did not finish and a malformed one did.
     # Arrange
     llm = SequenceLLM([CUT, BULLISH])
     agent = _agent(tmp_path, llm)
@@ -234,8 +241,38 @@ def test_the_second_ask_tells_the_model_its_answer_was_cut_off(tmp_path):
     agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
 
     # Assert
-    assert "did not finish" in llm.prompts[1]
+    assert "could not be read as JSON" in llm.prompts[1]
+    assert "one sentence" in llm.prompts[1]
     assert llm.prompts[1].startswith(llm.prompts[0])
+
+
+def test_a_malformed_object_is_asked_again_instead_of_abstaining(tmp_path):
+    # Arrange
+    llm = SequenceLLM([MALFORMED, BULLISH])
+    agent = _agent(tmp_path, llm)
+
+    # Act
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    # Assert
+    assert sig.metadata["abstained"] is False
+    assert sig.value == 0.8
+    assert len(llm.prompts) == 2
+
+
+def test_abstains_when_the_second_object_is_also_malformed(tmp_path):
+    # Arrange
+    llm = SequenceLLM([MALFORMED, MALFORMED])
+    agent = _agent(tmp_path, llm)
+
+    # Act
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+
+    # Assert — and the reason says what was wrong, not that nothing was found
+    assert sig.metadata["abstained"] is True
+    assert "would not parse" in sig.metadata["abstain_reason"]
+    assert "no JSON object found" not in sig.metadata["abstain_reason"]
+    assert len(llm.prompts) == 2
 
 
 def test_abstains_when_the_second_response_is_also_truncated(tmp_path):
