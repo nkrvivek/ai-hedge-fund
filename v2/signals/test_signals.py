@@ -110,3 +110,54 @@ class TestPEADPredict:
         fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
         sig = PEADModel().predict("TEST", "2025-08-01", fd)
         assert isinstance(sig, Signal)
+
+
+# ---------------------------------------------------------------------------
+# PEADModel neutrals — a 0.0 that says why
+#
+# Every branch above returns the same bare 0.0, so "the vendor gave us nothing"
+# and "the company reported three months ago and nothing has happened since"
+# reach the committee looking identical. One is a data gap and the other is a
+# reading. Only the second is evidence about the stock.
+# ---------------------------------------------------------------------------
+
+class TestPEADNeutralReasons:
+    def test_no_earnings_data_says_nothing_was_read(self):
+        sig = PEADModel().predict("TEST", "2025-08-01", MockFDClient([]))
+        assert sig.value == 0.0
+        assert sig.metadata["neutral_reason"] == "no-earnings-data"
+        assert "no earnings" in sig.reasoning.lower()
+
+    def test_records_without_a_surprise_are_not_a_missing_feed(self):
+        # The company reported and the print was in line. That is a reading, and
+        # it is not the same as never having heard from the vendor.
+        fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "MEET")])
+        sig = PEADModel().predict("TEST", "2025-08-01", fd)
+        assert sig.value == 0.0
+        assert sig.metadata["neutral_reason"] == "no-surprise-recorded"
+
+    def test_a_retrospective_only_history_reads_as_no_surprise_not_no_data(self):
+        # The rows arrived; the 45-day filter dropped them. Something was read.
+        fd = MockFDClient([_rec("2025-12-31", "2026-04-13", "BEAT")])
+        sig = PEADModel().predict("TEST", "2026-04-13", fd)
+        assert sig.metadata["neutral_reason"] == "no-surprise-recorded"
+
+    def test_a_filing_still_in_the_future_says_not_yet_reported(self):
+        fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
+        sig = PEADModel().predict("TEST", "2025-07-15", fd)
+        assert sig.metadata["neutral_reason"] == "not-yet-reported"
+
+    def test_a_stale_event_says_how_stale_it_is(self):
+        fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
+        sig = PEADModel().predict("TEST", "2025-08-31", fd)
+        assert sig.metadata["neutral_reason"] == "event-stale"
+        assert sig.metadata["days_since_filing"] == 30
+        # The event itself travels with the neutral. A reader that wants to know
+        # what the last print was should not have to re-fetch the history.
+        assert sig.metadata["filing_date"] == "2025-08-01"
+        assert sig.metadata["eps_surprise"] == "BEAT"
+
+    def test_a_firing_signal_carries_no_neutral_reason(self):
+        fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
+        sig = PEADModel().predict("TEST", "2025-08-01", fd)
+        assert "neutral_reason" not in sig.metadata

@@ -49,20 +49,53 @@ class PEADModel(QuantModel):
 
     def predict(self, ticker: str, date: str, data_client: DataClient) -> Signal:
         as_of = _parse_date(date)
-        events = self._qualifying_events(ticker, data_client)
+        records = self._records(ticker, data_client)
+        events = self._qualifying_events(records)
+
+        # Four ways to hold no view, and they are not the same fact. The first
+        # says nothing was read; the rest are readings. A committee handed a
+        # bare 0.0 cannot tell an empty feed from a company that reported in
+        # line, and would weigh the two the same.
+        if not records:
+            return self._neutral(
+                ticker, date, "no-earnings-data",
+                "no earnings history was returned for this ticker",
+            )
+        if not events:
+            return self._neutral(
+                ticker, date, "no-surprise-recorded",
+                f"{len(records)} earnings record(s) read, none carrying a BEAT or MISS",
+            )
 
         # Point-in-time: only consider filings on or before `date` (no lookahead)
         past = [e for e in events if _parse_date(e["filing_date"]) <= as_of]
         if not past:
-            return self._neutral(ticker, date)
+            return self._neutral(
+                ticker, date, "not-yet-reported",
+                "every earnings filing on record was filed after this date",
+            )
 
         # Most recent qualifying event as of `date`
         event = max(past, key=lambda e: e["filing_date"])
         filed = _parse_date(event["filing_date"])
+        age = (as_of - filed).days
 
         # Only fire if the event is fresh (we just learned about it)
-        if (as_of - filed).days > self._signal_window_days:
-            return self._neutral(ticker, date)
+        if age > self._signal_window_days:
+            return self._neutral(
+                ticker, date, "event-stale",
+                (
+                    f"last {event['surprise']} filed {event['filing_date']}, "
+                    f"{age} days ago, outside the {self._signal_window_days}-day window"
+                ),
+                # The event travels with the neutral. A reader that wants to
+                # know what the last print was should not have to re-fetch.
+                days_since_filing=age,
+                eps_surprise=event["surprise"],
+                source_type=event["source_type"],
+                report_period=event["report_period"],
+                filing_date=event["filing_date"],
+            )
 
         surprise = event["surprise"]
         value = 1.0 if surprise == "BEAT" else -1.0
@@ -87,11 +120,29 @@ class PEADModel(QuantModel):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _neutral(self, ticker: str, date: str) -> Signal:
-        return Signal(model_name=self.name, ticker=ticker, date=date, value=0.0)
+    def _neutral(self, ticker: str, date: str, reason: str, why: str, **extra) -> Signal:
+        """A 0.0 that says which of the four silences this is."""
+        return Signal(
+            model_name=self.name,
+            ticker=ticker,
+            date=date,
+            value=0.0,
+            reasoning=why,
+            metadata={"neutral_reason": reason, **extra},
+        )
 
-    def _qualifying_events(self, ticker: str, data_client: DataClient) -> list[dict]:
-        """Return BEAT/MISS events for a ticker, deduped + retrospective-filtered.
+    def _records(self, ticker: str, data_client: DataClient) -> list[EarningsRecord]:
+        """The raw history, fetched once per ticker.
+
+        Kept apart from the cleaning below so an empty feed and a feed whose
+        rows all fell out of the filters do not read alike.
+        """
+        if ticker not in self._cache:
+            self._cache[ticker] = data_client.get_earnings_history(ticker, limit=self._earnings_limit)
+        return self._cache[ticker]
+
+    def _qualifying_events(self, records: list[EarningsRecord]) -> list[dict]:
+        """Return BEAT/MISS events, deduped + retrospective-filtered.
 
         Mirrors the Week 3 PEAD cleaning: one event per (report_period),
         preferring the 8-K (the actual announcement) over later 10-Q/K
@@ -99,12 +150,6 @@ class PEADModel(QuantModel):
         after the report period (the extractor sometimes parses prior-quarter
         comparison data from a current 8-K).
         """
-        if ticker in self._cache:
-            records = self._cache[ticker]
-        else:
-            records = data_client.get_earnings_history(ticker, limit=self._earnings_limit)
-            self._cache[ticker] = records
-
         best: dict[str, tuple[int, EarningsRecord]] = {}
         for r in records:
             if not r.filing_date or not r.quarterly:
