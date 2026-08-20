@@ -7,6 +7,8 @@ from datetime import date, timedelta
 
 import pytest
 
+from v2.data.fd_live import why_fd_cannot_answer
+
 from v2.backtesting import BacktestEngine
 from v2.data.models import Price
 from v2.models import Signal
@@ -200,13 +202,25 @@ def fd():
         yield client
 
 
+@pytest.fixture(scope="module")
+def fd_paid(fd):
+    """`fd`, but skips when the prepaid balance is gone. See v2/data/fd_live.py.
+
+    Not autouse: the mocked tests in this file never touch the API and must
+    keep running when the balance does not.
+    """
+    reason = why_fd_cannot_answer(fd)
+    if reason:
+        pytest.skip(reason)
+    return fd
+
 @pytestmark_live
-def test_pead_alpha_live(fd):
+def test_pead_alpha_live(fd_paid):
     from v2.signals import PEADModel
     import math
 
     result = BacktestEngine().run_alpha(
-        PEADModel(), ["AAPL"], fd, "2024-06-01", date.today().isoformat(),
+        PEADModel(), ["AAPL"], fd_paid, "2024-06-01", date.today().isoformat(),
         holding_days=5,
     )
     assert len(result.trades) > 0

@@ -7,6 +7,8 @@ import os
 import numpy as np
 import pytest
 
+from v2.data.fd_live import why_fd_cannot_answer
+
 from v2.event_study.models import EventCAR, EventStudyResult, MarketModelFit
 from v2.event_study.stats import (
     bootstrap_ci,
@@ -189,11 +191,23 @@ def fd():
         yield client
 
 
+@pytest.fixture(scope="module")
+def fd_paid(fd):
+    """`fd`, but skips when the prepaid balance is gone. See v2/data/fd_live.py.
+
+    Not autouse: the mocked tests in this file never touch the API and must
+    keep running when the balance does not.
+    """
+    reason = why_fd_cannot_answer(fd)
+    if reason:
+        pytest.skip(reason)
+    return fd
+
 @pytestmark_live
-def test_compute_car_live(fd):
+def test_compute_car_live(fd_paid):
     from v2.event_study import compute_car
 
-    result = compute_car(["AAPL"], fd, earnings_limit=4, rng_seed=42)
+    result = compute_car(["AAPL"], fd_paid, earnings_limit=4, rng_seed=42)
     assert len(result.events) > 0, "Expected at least one event for AAPL"
     for e in result.events:
         assert e.ticker == "AAPL"
@@ -203,10 +217,10 @@ def test_compute_car_live(fd):
 
 
 @pytestmark_live
-def test_compute_car_multi_ticker(fd):
+def test_compute_car_multi_ticker(fd_paid):
     from v2.event_study import compute_car
 
-    result = compute_car(["AAPL", "MSFT", "NVDA"], fd, earnings_limit=4, rng_seed=42)
+    result = compute_car(["AAPL", "MSFT", "NVDA"], fd_paid, earnings_limit=4, rng_seed=42)
     tickers_seen = {e.ticker for e in result.events}
     assert len(tickers_seen) >= 2, f"Expected multiple tickers, got {tickers_seen}"
     source_types_seen = {e.source_type for e in result.events}

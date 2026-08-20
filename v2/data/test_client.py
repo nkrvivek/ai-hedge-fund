@@ -4,6 +4,7 @@ import os
 import pytest
 
 from v2.data import FDClient
+from v2.data.fd_live import why_fd_cannot_answer
 
 TICKERS = ["AAPL", "MSFT", "NVDA", "JPM", "XOM"]
 PRICE_START = "2024-01-01"
@@ -19,6 +20,13 @@ pytestmark = pytest.mark.skipif(
 def fd():
     with FDClient() as client:
         yield client
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _fd_balance(fd):
+    reason = why_fd_cannot_answer(fd)
+    if reason:
+        pytest.skip(reason)
 
 
 @pytest.mark.parametrize("ticker", TICKERS)
