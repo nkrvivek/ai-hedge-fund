@@ -7,9 +7,11 @@ CachedDataClient upstream).
 
 The FMP plan was upgraded on 2026-08-20 ($230/yr). The 250/day free quota that
 this comment used to name is gone, and so is the per-symbol 402 that killed
-whole committees: LLY and CBRS both answer 200 now. The new daily allowance is
-NOT measured and FMP still sends no quota header, so nothing here should be
-read as room to spend freely.
+whole committees: LLY and CBRS both answer 200 now. The Starter plan has no
+daily call cap at all. It caps a trailing 30 days of bandwidth at 20GB, and FMP
+still sends no quota header, so every FMP response is weighed in _get and
+written to ~/.fmp-spend/<day>/, which trade-refresh's src.fmp_quota reads across
+all five consumers of the shared key.
 
 Contract (v2/data/protocol.py): empty/None = data genuinely absent;
 infrastructure failures RAISE. Point-in-time: nothing dated after end_date
@@ -23,6 +25,7 @@ from typing import Any
 
 import requests
 
+from v2.data import fmp_spend
 from v2.data.models import (
     CompanyFacts,
     CompanyNews,
@@ -39,8 +42,31 @@ FMP = "https://financialmodelingprep.com/api/v3"
 ALPACA_DATA = "https://data.alpaca.markets/v2"
 
 
+# The name this process reports under in trade-refresh/fmp-consumers.json.
+FMP_CONSUMER = "ai-hedge-fund"
+
+
 class HomeClientError(RuntimeError):
     pass
+
+
+def _response_bytes(resp: Any) -> int | None:
+    """Wire bytes for one response, or None when the size cannot be read.
+
+    `content-length` is what crossed the wire, which is what the bandwidth cap
+    counts. The decompressed body is a fallback, not an equal. Neither means
+    the call is counted with unknown size, never as zero bytes.
+    """
+    raw = resp.headers.get("content-length")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return len(resp.content)
+    except Exception:  # noqa: BLE001 — a body that cannot be sized is not zero
+        return None
 
 
 def _num(v: Any) -> float | None:
@@ -60,10 +86,20 @@ class HomeDataClient:
         if not self.uw:
             raise HomeClientError("UW_TOKEN missing")
         self.session = requests.Session()
+        # A zero row, so a run that makes no FMP calls is measured rather than
+        # indistinguishable from a counter nobody installed.
+        fmp_spend.touch(FMP_CONSUMER)
 
     # -- low-level ---------------------------------------------------------
     def _get(self, url: str, headers: dict, params: dict | None = None) -> Any:
         resp = self.session.get(url, headers=headers, params=params or {}, timeout=30)
+        if "financialmodelingprep.com" in url:
+            # Weighed before the status checks: a 402 and a 429 both cost
+            # bandwidth, and a counter that only counted the calls that worked
+            # would understate the days the key was in trouble.
+            fmp_spend.record(
+                FMP_CONSUMER, _response_bytes(resp), limit_hit=resp.status_code == 429
+            )
         if resp.status_code == 404:
             return None
         if not resp.ok:
