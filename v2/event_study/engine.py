@@ -37,6 +37,7 @@ from v2.event_study.models import (
     AggregateResult,
     EventCAR,
     EventStudyResult,
+    EstimationWindow,
     WindowStats,
 )
 from v2.event_study.stats import (
@@ -56,9 +57,64 @@ _MARKET_TICKER = "SPY"             # market proxy for the market model
 _ESTIMATION_START = -250           # start of estimation window (trading days before event)
 _ESTIMATION_END = -11              # end of estimation window (10-day buffer avoids contamination)
 _MIN_ESTIMATION_DAYS = 200         # skip events without enough pre-event price history
+_MIN_ESTIMATION_FLOOR = 60         # below this a market model is noise, not an estimate
+_MAX_HISTORY_SHARE = 2             # estimation may claim at most this fraction of the feed
 _MAX_EVENT_WINDOW = 20             # widest post-event window (day 0 through day +20)
 _RETROSPECTIVE_CUTOFF_DAYS = 45    # max days between filing_date and report_period
 _CAR_WINDOWS = [(0, 1), (0, 5), (0, 20)]  # the three event windows we compute CARs for
+
+
+# ---------------------------------------------------------------------------
+# Estimation window
+# ---------------------------------------------------------------------------
+
+def plan_estimation_window(
+    n_returns: int,
+    *,
+    configured_start: int = _ESTIMATION_START,
+    configured_min: int = _MIN_ESTIMATION_DAYS,
+    allow_narrow: bool = True,
+) -> EstimationWindow | None:
+    """Choose the estimation window this much history can support.
+
+    A deeper window needs the event to sit further into the series, so on a
+    short feed depth and event count trade directly against each other. The
+    split is fixed rather than fitted: estimation may claim at most half the
+    return days, and events in the other half get measured. Fixing it keeps
+    the window off the events, because a window chosen to admit particular
+    filings is a window chosen by the data.
+
+    Returns None when no window clears the floor, or when narrowing is
+    needed and the caller refused it.
+    """
+    max_lookback = n_returns // _MAX_HISTORY_SHARE
+    start = max(configured_start, -max_lookback)
+    n_days = _ESTIMATION_END - start + 1
+
+    if n_days < _MIN_ESTIMATION_FLOOR:
+        return None
+
+    narrowed = start != configured_start
+    if narrowed and not allow_narrow:
+        return None
+
+    if narrowed:
+        reason = (
+            f"feed holds {n_returns} return days; the configured "
+            f"{configured_start}-day window leaves no room for an event to "
+            f"sit in front of it, so the window narrowed to {start}"
+        )
+    else:
+        reason = f"feed holds {n_returns} return days; configured window fits"
+
+    return EstimationWindow(
+        start=start,
+        end=_ESTIMATION_END,
+        n_days=n_days,
+        min_days=min(configured_min, n_days),
+        narrowed=narrowed,
+        reason=reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +130,9 @@ def compute_car(
     n_bootstrap: int = 10_000,
     rng_seed: int | None = None,
     require_eps_surprise: bool = False,
+    estimation_start: int = _ESTIMATION_START,
+    min_estimation_days: int = _MIN_ESTIMATION_DAYS,
+    allow_narrow_window: bool = True,
 ) -> EventStudyResult:
     """Compute CARs for earnings events across multiple tickers.
 
@@ -90,33 +149,55 @@ def compute_car(
         n_bootstrap:          Number of bootstrap resamples for CIs.
         rng_seed:             Seed for bootstrap reproducibility (None = random).
         require_eps_surprise: If True, only include events with BEAT/MISS/MEET label.
+        estimation_start:     Estimation window start, in trading days before the event.
+        min_estimation_days:  Fewest observations an event may be fitted on.
+        allow_narrow_window:  If False, refuse to fit at all rather than fit shallower.
 
     Returns:
-        EventStudyResult with per-event CARs, aggregate stats, and skipped tickers.
+        EventStudyResult with per-event CARs, aggregate stats, the estimation
+        window used, and a reason for every skipped ticker.
     """
     today = date.today().isoformat()
 
     # Fetch market (SPY) prices once — covers all tickers.
     # Start from 2023-01-01 to have enough history for any event's estimation window.
+    # The plan may serve far less than that without saying so, which is why the
+    # window is planned from what arrived rather than from what was asked for.
     spy_prices = data_client.get_prices(market_ticker, "2023-01-01", today)
     if not spy_prices:
-        logger.warning("No SPY prices returned — cannot compute CARs")
-        return EventStudyResult(skipped_tickers=list(tickers))
+        logger.warning("No %s prices returned, cannot compute CARs", market_ticker)
+        return _all_skipped(tickers, "no-market-prices")
 
     # Build a lookup: date string -> closing price
     spy_closes = {p.time[:10]: p.close for p in spy_prices}
 
+    window = plan_estimation_window(
+        len(spy_closes) - 1,
+        configured_start=estimation_start,
+        configured_min=min_estimation_days,
+        allow_narrow=allow_narrow_window,
+    )
+    if window is None:
+        logger.warning(
+            "%s history (%d bars) supports no usable estimation window",
+            market_ticker, len(spy_closes),
+        )
+        return _all_skipped(tickers, "short-history")
+    if window.narrowed:
+        logger.warning("Estimation window narrowed: %s", window.reason)
+
     all_events: list[EventCAR] = []
-    skipped: list[str] = []
+    skip_reasons: dict[str, str] = {}
 
     for ticker in tickers:
-        events = _compute_ticker_events(
-            ticker, data_client, spy_closes, earnings_limit=earnings_limit,
+        events, reason = _compute_ticker_events(
+            ticker, data_client, spy_closes, window,
+            earnings_limit=earnings_limit,
         )
         if events:
             all_events.extend(events)
         else:
-            skipped.append(ticker)
+            skip_reasons[ticker] = reason or "no-usable-events"
 
     # Drop events without EPS surprise labels if requested
     if require_eps_surprise:
@@ -126,7 +207,19 @@ def compute_car(
     aggregates = _aggregate(all_events, n_bootstrap, rng_seed)
 
     return EventStudyResult(
-        events=all_events, aggregates=aggregates, skipped_tickers=skipped,
+        events=all_events,
+        aggregates=aggregates,
+        skipped_tickers=list(skip_reasons),
+        skip_reasons=skip_reasons,
+        estimation_window=window,
+    )
+
+
+def _all_skipped(tickers: list[str], reason: str) -> EventStudyResult:
+    """Every ticker skipped for the same reason, named."""
+    return EventStudyResult(
+        skipped_tickers=list(tickers),
+        skip_reasons={t: reason for t in tickers},
     )
 
 
@@ -138,10 +231,15 @@ def _compute_ticker_events(
     ticker: str,
     data_client: DataClient,
     spy_closes: dict[str, float],
+    window: EstimationWindow,
     *,
     earnings_limit: int = 12,
-) -> list[EventCAR]:
+) -> tuple[list[EventCAR], str | None]:
     """Compute CARs for all valid earnings events of a single ticker.
+
+    Returns the events and, when there are none, why. Every empty answer
+    here used to look the same from outside, so a feed that served nothing
+    and a company that filed nothing were the same finding.
 
     Steps:
     1. Fetch earnings history (list of filings: 8-K, 10-Q, 10-K, 20-F).
@@ -153,12 +251,12 @@ def _compute_ticker_events(
     # Step 1: Get earnings filings for this ticker
     records = data_client.get_earnings_history(ticker, limit=earnings_limit)
     if not records:
-        return []
+        return [], "no-earnings-history"
 
     # Step 2: Drop retrospective rows (e.g., Q4 data parsed from a Q1 8-K)
     records = _filter_retrospective(records)
     if not records:
-        return []
+        return [], "all-retrospective"
 
     # Step 3: Fetch stock prices — one call covering all events.
     # Earliest event needs ~400 calendar days of history for the estimation window.
@@ -171,14 +269,17 @@ def _compute_ticker_events(
 
     stock_prices = data_client.get_prices(ticker, price_start, price_end)
     if not stock_prices:
-        return []
+        return [], "no-prices"
 
     # Step 4: Build aligned return series.
     # Only use dates where BOTH stock and SPY have closing prices.
     stock_closes = {p.time[:10]: p.close for p in stock_prices}
     trading_days = sorted(set(stock_closes) & set(spy_closes))
-    if len(trading_days) < _MIN_ESTIMATION_DAYS + _MAX_EVENT_WINDOW:
-        return []
+    # One fewer return than closes, and an event needs -window.start of them
+    # in front of it. Fewer than that and no event in this series can be
+    # fitted, whatever the filing dates happen to be.
+    if len(trading_days) - 1 <= -window.start:
+        return [], "short-history"
 
     # Convert aligned closes to numpy arrays in date order
     stock_close_arr = np.array([stock_closes[d] for d in trading_days])
@@ -197,12 +298,12 @@ def _compute_ticker_events(
     events: list[EventCAR] = []
     for record in records:
         event = _process_event(
-            record, stock_returns, spy_returns, return_days, day_to_idx,
+            record, stock_returns, spy_returns, return_days, day_to_idx, window,
         )
         if event is not None:
             events.append(event)
 
-    return events
+    return events, None if events else "no-usable-events"
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +316,7 @@ def _process_event(
     spy_returns: np.ndarray,
     return_days: list[str],
     day_to_idx: dict[str, int],
+    window: EstimationWindow,
 ) -> EventCAR | None:
     """Process a single earnings event into an EventCAR.
 
@@ -223,7 +325,7 @@ def _process_event(
 
     The pipeline for one event:
     1. Find event day 0 in the trading day index.
-    2. Extract estimation window [-250, -11] for market model OLS.
+    2. Extract the run's estimation window for market model OLS.
     3. Fit alpha, beta.
     4. Extract event window [0, +20] for abnormal returns.
     5. Compute daily AR and cumulate into CARs for each window.
@@ -236,17 +338,17 @@ def _process_event(
     if event_idx is None:
         return None
 
-    # Estimation window: [-250, -11] trading days relative to event.
-    # The 10-day buffer (-11 instead of -1) prevents pre-announcement
+    # Estimation window in trading days relative to the event, as planned
+    # for this run. The 10-day buffer at the near end prevents pre-announcement
     # drift / leakage from contaminating the alpha/beta estimates.
-    est_start = event_idx + _ESTIMATION_START
-    est_end = event_idx + _ESTIMATION_END
+    est_start = event_idx + window.start
+    est_end = event_idx + window.end
     if est_start < 0 or est_end < 0:
         return None
 
     stock_est = stock_returns[est_start : est_end + 1]
     spy_est = spy_returns[est_start : est_end + 1]
-    if len(stock_est) < _MIN_ESTIMATION_DAYS:
+    if len(stock_est) < window.min_days:
         return None
 
     # Fit market model: R_stock = alpha + beta * R_spy

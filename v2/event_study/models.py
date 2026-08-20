@@ -90,14 +90,39 @@ class AggregateResult(BaseModel):
     windows: list[WindowStats] = Field(default_factory=list)
 
 
+class EstimationWindow(BaseModel):
+    """The estimation window the run actually used.
+
+    The configured window is 250 trading days deep. A feed that holds one
+    year cannot support it, so the run narrows the window to what the data
+    allows. That changes alpha, beta and every CAR computed from them, which
+    makes it a stated choice rather than something to discover later from a
+    surprising number.
+    """
+
+    start: int             # trading days before the event, negative
+    end: int               # last day of the window, also negative
+    n_days: int            # end - start + 1
+    min_days: int          # fewest observations an event may be fitted on
+    narrowed: bool         # True when the feed forced a shallower window
+    reason: str            # what the run did and why
+
+
 class EventStudyResult(BaseModel):
     """Top-level result returned by compute_car().
 
     Contains per-event detail (events), cross-sectional aggregates
-    (segmented by source_type), and a list of tickers that were
-    skipped due to missing data.
+    (segmented by source_type), the estimation window that was used, and
+    why each skipped ticker was skipped.
+
+    skip_reasons exists because skipped_tickers carried two meanings that
+    printed the same. A company with no earnings filings and a company the
+    feed could not cover are different findings, and reading the first as
+    the second is how a data fault gets filed as a market observation.
     """
 
     events: list[EventCAR] = Field(default_factory=list)
     aggregates: list[AggregateResult] = Field(default_factory=list)
     skipped_tickers: list[str] = Field(default_factory=list)
+    skip_reasons: dict[str, str] = Field(default_factory=dict)
+    estimation_window: EstimationWindow | None = None

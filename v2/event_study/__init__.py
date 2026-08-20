@@ -8,6 +8,7 @@ from v2.event_study.engine import compute_car
 from v2.event_study.models import (
     AggregateResult,
     BootstrapCI,
+    EstimationWindow,
     EventCAR,
     EventStudyResult,
     MarketModelFit,
@@ -23,6 +24,7 @@ __all__ = [
     "compute_car",
     "AggregateResult",
     "BootstrapCI",
+    "EstimationWindow",
     "EventCAR",
     "EventStudyResult",
     "MarketModelFit",

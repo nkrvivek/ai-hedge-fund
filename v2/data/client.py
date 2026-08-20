@@ -8,6 +8,8 @@ import time
 
 import requests
 
+from v2.data.coverage import check_price_coverage
+from v2.data.errors import FDClientError, FDCoverageError
 from v2.data.models import (
     CompanyFacts,
     CompanyNews,
@@ -20,17 +22,7 @@ from v2.data.models import (
 
 logger = logging.getLogger(__name__)
 
-
-class FDClientError(Exception):
-    """An API request failed for infrastructure reasons (auth, rate limit,
-    server error, network). Distinct from "no data exists" — that returns
-    empty. A backtest must crash on this, not treat it as no-data.
-    """
-
-    def __init__(self, message: str, *, status_code: int | None = None, path: str | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.path = path
+__all__ = ["FDClient", "FDClientError", "FDCoverageError"]
 
 
 class FDClient:
@@ -44,6 +36,11 @@ class FDClient:
 
     BASE_URL = "https://api.financialdatasets.ai"
     _RETRY_DELAYS = (5, 15, 30)
+    # /prices/ serves 100 rows a page and ignores limit. Ten years of
+    # daily bars is about 2,520 rows, so 40 pages covers any window a
+    # caller has reason to ask for while still ending a server that
+    # hands back a cursor forever.
+    _MAX_PAGES = 40
 
     def __init__(
         self,
@@ -80,16 +77,31 @@ class FDClient:
         end_date: str,
         interval: str = "day",
         interval_multiplier: int = 1,
+        *,
+        max_pages: int | None = None,
+        require_full_range: bool = False,
     ) -> list[Price]:
-        """Fetch OHLC price bars."""
-        data = self._get("/prices/", {
+        """Fetch OHLC price bars, following the cursor to the last page.
+
+        The endpoint serves 100 rows a page and ignores ``limit``. It also
+        clamps history to about a year on this plan, silently, which paging
+        cannot undo. Pass ``require_full_range=True`` when a short window
+        would make the answer wrong rather than merely smaller; otherwise the
+        gap is logged and the rows are returned.
+        """
+        rows = self._get_paged("/prices/", {
             "ticker": ticker,
             "interval": interval,
             "interval_multiplier": interval_multiplier,
             "start_date": start_date,
             "end_date": end_date,
-        }, response_key="prices")
-        return [Price(**row) for row in data] if data else []
+        }, response_key="prices", max_pages=max_pages or self._MAX_PAGES)
+        prices = [Price(**row) for row in rows]
+        check_price_coverage(
+            prices, ticker, start_date, end_date,
+            require_full_range=require_full_range, path="/prices/",
+        )
+        return prices
 
     # ------------------------------------------------------------------
     # Financial Metrics
@@ -226,10 +238,52 @@ class FDClient:
             return None
         return resp.json().get(response_key)
 
+    def _get_paged(
+        self,
+        path: str,
+        params: dict,
+        response_key: str,
+        max_pages: int,
+    ) -> list[dict]:
+        """GET and follow next_page_url until it runs out.
+
+        The cursor URL already carries the query, so it is requested verbatim.
+        Re-sending params alongside it would reset the walk to page one and
+        loop forever. Two other things end the walk: a repeated cursor, which
+        means the server has stopped advancing, and the page cap.
+        """
+        rows: list[dict] = []
+        seen: set[str] = set()
+        next_url: str | None = None
+
+        for _ in range(max_pages):
+            if next_url is None:
+                resp = self._request("GET", path, params=params)
+            else:
+                resp = self._request("GET", path, url=next_url)
+            if resp is None:
+                break
+
+            payload = resp.json()
+            rows.extend(payload.get(response_key) or [])
+
+            next_url = payload.get("next_page_url")
+            if not next_url or next_url in seen:
+                break
+            seen.add(next_url)
+        else:
+            logger.warning(
+                "%s: stopped at the %d-page cap with a cursor still open; "
+                "rows beyond that point were not read",
+                path, max_pages,
+            )
+        return rows
+
     def _request(
         self,
         method: str,
         path: str,
+        url: str | None = None,
         **kwargs,
     ) -> requests.Response | None:
         """HTTP request with retry on 429.
@@ -240,11 +294,11 @@ class FDClient:
         Silently returning empty on real failures poisons backtests
         (missing data reads as "no signal").
         """
-        url = self.BASE_URL + path
+        target = url or (self.BASE_URL + path)
         for attempt, delay in enumerate((*self._RETRY_DELAYS, None)):
             try:
                 resp = self._session.request(
-                    method, url, timeout=self._timeout, **kwargs,
+                    method, target, timeout=self._timeout, **kwargs,
                 )
             except requests.RequestException as exc:
                 raise FDClientError(

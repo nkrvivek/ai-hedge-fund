@@ -21,6 +21,7 @@ from datetime import date
 from pathlib import Path
 from typing import Callable
 
+from v2.data.coverage import check_price_coverage
 from v2.data.models import (
     CompanyFacts,
     CompanyNews,
@@ -52,14 +53,22 @@ class CachedDataClient:
     # DataClient protocol
     # ------------------------------------------------------------------
 
-    def get_prices(self, ticker, start_date, end_date, interval="day", interval_multiplier=1):
-        return self._cached_list(
+    def get_prices(self, ticker, start_date, end_date, interval="day",
+                   interval_multiplier=1, *, require_full_range=False, **kwargs):
+        prices = self._cached_list(
             "get_prices", Price,
             {"ticker": ticker, "start_date": start_date, "end_date": end_date,
              "interval": interval, "interval_multiplier": interval_multiplier},
             lambda: self._client.get_prices(
-                ticker, start_date, end_date, interval, interval_multiplier),
+                ticker, start_date, end_date, interval, interval_multiplier, **kwargs),
         )
+        # A cached short read is still a short read. Re-checking on the hit
+        # path keeps the second call from answering more quietly than the first.
+        check_price_coverage(
+            prices, ticker, start_date, end_date,
+            require_full_range=require_full_range,
+        )
+        return prices
 
     def get_financial_metrics(self, ticker, end_date, period="ttm", limit=10):
         return self._cached_list(
