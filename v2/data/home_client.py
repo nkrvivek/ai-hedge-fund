@@ -1,9 +1,15 @@
 """HomeDataClient — DataClient implementation on owned sources (no financialdatasets.ai).
 
 Sources: Alpaca (daily bars, free w/ paper keys) · UnusualWhales (earnings
-history, market cap; flat-rate sub) · FMP (quarterly ratio metrics; free
-250/day quota is SHARED with autopilot — calls are minimized and disk-cached
-via CachedDataClient upstream).
+history, market cap; flat-rate sub) · FMP (ratio metrics; the key is SHARED
+with autopilot and trade-refresh, so calls are minimized and disk-cached via
+CachedDataClient upstream).
+
+The FMP plan was upgraded on 2026-08-20 ($230/yr). The 250/day free quota that
+this comment used to name is gone, and so is the per-symbol 402 that killed
+whole committees: LLY and CBRS both answer 200 now. The new daily allowance is
+NOT measured and FMP still sends no quota header, so nothing here should be
+read as room to spend freely.
 
 Contract (v2/data/protocol.py): empty/None = data genuinely absent;
 infrastructure failures RAISE. Point-in-time: nothing dated after end_date
@@ -106,9 +112,15 @@ class HomeDataClient:
             # post-2025 FMP key: /stable API; quarter is premium on ratios/
             # key-metrics -> annual there, quarterly growth still allowed.
             stable = "https://financialmodelingprep.com/stable"
-            # free stable tier: limit capped at 5
-            ann = {"symbol": ticker, "period": "annual", "limit": 5, "apikey": self.fmp}
-            qtr = {"symbol": ticker, "period": "quarter", "limit": 5, "apikey": self.fmp}
+            # Re-measured 2026-08-20 on the paid plan. Two halves moved apart:
+            # period=quarter on ratios and key-metrics still answers 402
+            # "Premium Query Parameter", so annual stays. The limit=5 ceiling is
+            # gone; annual limit=20 now returns 20 rows. Asking for 5 when the
+            # caller asked for 10 was silently handing the committee half its
+            # history, so the requested limit is passed through.
+            n = max(limit, 5)
+            ann = {"symbol": ticker, "period": "annual", "limit": n, "apikey": self.fmp}
+            qtr = {"symbol": ticker, "period": "quarter", "limit": n, "apikey": self.fmp}
             ratios = self._get(f"{stable}/ratios", {}, ann) or []
             kms = self._get(f"{stable}/key-metrics", {}, ann) or []
             gr = self._get(f"{stable}/financial-growth", {}, qtr) or []
