@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -187,6 +188,62 @@ def _is_failed_signal(v: dict) -> bool:
     count the run_daily per-agent except catch ('ERROR:' reasoning,
     v.get('abstained') is never set there)."""
     return bool(v.get("abstained")) or str(v.get("reasoning") or "").startswith("ERROR:")
+
+
+def _reason_label(reasoning: str) -> str:
+    """The cause of one dead signal, short enough to sit in an email line.
+
+    Every failure path writes its cause into `reasoning` and every surface then
+    printed the ratio instead. These are the four shapes that reach here:
+
+        abstained: insufficient data: ALOY as of 2026-08-21: only 3 filed ...
+        abstained: parse failed: response stopped inside an unclosed object
+        abstained: LLM call failed: <provider error>
+        ERROR: FDClientError: 402 payment required
+
+    The head of each is the part an operator acts on. The tail names one ticker
+    on one day and is already in the log.
+    """
+    text = (reasoning or "").strip()
+    if text.startswith("ERROR:"):
+        rest = text[len("ERROR:"):].strip()
+        head = re.split(r"[(:]", rest, maxsplit=1)[0].strip()
+        return f"ERROR: {head}" if head else "ERROR"
+    if text.startswith("abstained:"):
+        text = text[len("abstained:"):].strip()
+    return text.split(":", 1)[0].strip() or "unrecorded"
+
+
+def failure_reasons(views: dict) -> dict[str, int]:
+    """Why this ticker's committee died, cause first, with a count each.
+
+    Seven personas killed by one exhausted API key is one finding, not seven.
+    A committee that merely saw nothing worth saying returns {} — a quiet day
+    must not read as an outage.
+    """
+    counts: dict[str, int] = {}
+    for v in views.values():
+        if not _is_failed_signal(v):
+            continue
+        label = _reason_label(str(v.get("reasoning") or ""))
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def excluded_summary(excluded: dict[str, float], per_ticker: dict) -> str:
+    """The exclusion line the operator reads, in the log and in the email.
+
+    Before 2026-08-21 this said "ALOY 88% failed" and stopped, so a key that
+    needed topping up, a provider outage and a name with too few filings all
+    printed the same sentence. The ratio says how much; only the reason says
+    what to do.
+    """
+    parts = []
+    for ticker, ratio in sorted(excluded.items()):
+        reasons = failure_reasons(per_ticker.get(ticker) or {})
+        why = ", ".join(f"{r} \u00d7{n}" for r, n in reasons.items()) or "reason unrecorded"
+        parts.append(f"{ticker} {ratio:.0%} failed ({why})")
+    return ", ".join(parts)
 
 
 def llm_failure_ratio(per_ticker: dict[str, dict],
@@ -364,7 +421,13 @@ def main() -> None:
                     views[agent] = {"value": sig.value, "reasoning": sig.reasoning,
                                     "abstained": bool(sig.metadata.get("abstained", False))}
                 except Exception as e:  # one agent failing must not kill the run
-                    views[agent] = {"value": 0.0, "reasoning": f"ERROR: {e}"}
+                    # Naming the class and printing it is the whole point: before
+                    # 2026-08-21 this reason went into the view and nowhere else,
+                    # so a dead committee printed a percentage and no cause.
+                    print(f"  {ticker} {agent} failed: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+                    views[agent] = {"value": 0.0,
+                                    "reasoning": f"ERROR: {type(e).__name__}: {e}"}
             per_ticker[ticker] = views
             print(f"{ticker}: " + " ".join(f"{a}={v['value']:+.2f}" for a, v in views.items()))
 
@@ -405,7 +468,7 @@ def main() -> None:
     excluded = {t: r for t, r in ticker_ratios.items() if r >= FAIL_THRESHOLD}
     if excluded:
         print("excluded (dead committee, held as-is): "
-              + ", ".join(f"{t} {r:.0%}" for t, r in sorted(excluded.items())))
+              + excluded_summary(excluded, per_ticker))
 
     convictions = {t: composite([v["value"] for v in views.values()])
                    for t, views in per_ticker.items() if t not in excluded}
@@ -532,7 +595,9 @@ def main() -> None:
     _send_daily_email(asof=asof, equity=equity, convictions=convictions,
                       targets=targets, placed=placed if placed else orders,
                       fail_ratio=fail_ratio, dry_run=args.dry_run,
-                      excluded=excluded, hedge=hedge, probation=probation)
+                      excluded=excluded,
+                      excluded_note=excluded_summary(excluded, per_ticker) if excluded else None,
+                      hedge=hedge, probation=probation)
 
 
 def _hedge_email_line(hedge: dict | None) -> str:
@@ -556,6 +621,7 @@ def _hedge_email_line(hedge: dict | None) -> str:
 def _send_daily_email(*, asof: str, equity: float, convictions: dict,
                       targets: dict, placed: list, fail_ratio: float,
                       dry_run: bool, excluded: dict[str, float] | None = None,
+                      excluded_note: str | None = None,
                       halt_reason: str | None = None,
                       hedge: dict | None = None,
                       probation: str | None = None) -> None:
@@ -595,8 +661,12 @@ def _send_daily_email(*, asof: str, equity: float, convictions: dict,
             f"{o.get('symbol','?')} — {o.get('status') or o.get('error') or o.get('skipped') or 'staged'}</li>"
             for o in placed) or "<li>no rebalance orders</li>"
         if excluded:
+            # excluded_note carries the cause. Without it the reader gets a
+            # percentage and no way to tell an exhausted key from a name with
+            # too few filings, which is the 2026-08-21 complaint.
             health = ("🔴 excluded (dead committee, held as-is): "
-                      + ", ".join(f"{t} {r:.0%} failed" for t, r in sorted(excluded.items())))
+                      + (excluded_note or ", ".join(
+                          f"{t} {r:.0%} failed" for t, r in sorted(excluded.items()))))
         elif fail_ratio >= FAIL_THRESHOLD:
             health = f"🔴 {fail_ratio:.0%} committee signals failed"
         elif fail_ratio > 0:

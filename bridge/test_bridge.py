@@ -401,3 +401,91 @@ def test_daily_closes_pins_the_feed_the_key_can_actually_read():
     _client_with(session).daily_closes(["MU"], "2026-07-27", "2026-08-01")
 
     assert session.calls[0][1]["feed"] == "iex"
+
+
+# ---------------------------------------------------------------------------
+# failure_reasons / excluded_summary — say WHY the committee died
+#
+# 2026-08-21. The digest read "🔴 excluded (dead committee, held as-is):
+# ALOY 88% failed" and stopped there. ALOY had been in the universe the day
+# before and had been fine, its fundamentals answered 14 filed periods when
+# checked by hand the same afternoon, and one parse failure was logged all
+# run — for a different ticker. So the exclusion was real and its cause was
+# nowhere: the reason existed inside `views` and no surface printed it.
+#
+# Two paths threw the reason away. `LLMAgent.predict` catches InsufficientData
+# and abstains without logging, the only abstain path that logs nothing. And
+# the per-agent `except` in run_daily writes "ERROR: {e}" into the view and
+# never prints it. Both surface as `+0.00` in the ticker line and a percentage
+# in the email, which is a number the operator cannot act on.
+# ---------------------------------------------------------------------------
+
+def test_failure_reasons_collapses_one_cause_into_a_count():
+    """Seven personas dying of the same thing is one finding with a count,
+    not seven lines."""
+    from bridge.run_daily import failure_reasons
+    views = {
+        f"p{i}": {"value": 0.0, "abstained": True,
+                  "reasoning": "abstained: insufficient data: ALOY as of "
+                               "2026-08-21: only 3 filed periods (need 4)"}
+        for i in range(7)
+    }
+    views["pead"] = {"value": 0.0, "reasoning": "neutral", "abstained": False}
+    assert failure_reasons(views) == {"insufficient data": 7}
+
+
+def test_failure_reasons_ignores_opinions_including_a_neutral_one():
+    """A persona that looked and said nothing is judgment, not plumbing. A
+    committee of genuine zeros must report no reasons at all, or every quiet
+    day reads as an outage."""
+    from bridge.run_daily import failure_reasons
+    views = {f"p{i}": {"value": 0.0, "reasoning": "no edge here",
+                       "abstained": False} for i in range(8)}
+    assert failure_reasons(views) == {}
+
+
+def test_failure_reasons_names_the_exception_class_on_the_error_path():
+    """`ERROR` alone says only that something threw. The class is the part
+    that tells the operator whether to top up a key or read a stack trace."""
+    from bridge.run_daily import failure_reasons
+    views = {
+        "a": {"value": 0.0, "reasoning": "ERROR: HomeClientError('FMP 402')"},
+        "b": {"value": 0.0, "reasoning": "ERROR: HomeClientError('FMP 402')"},
+        "c": {"value": 0.0, "abstained": True,
+              "reasoning": "abstained: parse failed: response stopped inside "
+                           "an unclosed JSON object"},
+    }
+    assert failure_reasons(views) == {"ERROR: HomeClientError": 2,
+                                      "parse failed": 1}
+
+
+def test_failure_reasons_orders_the_dominant_cause_first():
+    """Two causes in one committee: the operator reads the first one."""
+    from bridge.run_daily import failure_reasons
+    views = {
+        "a": {"value": 0.0, "abstained": True, "reasoning": "abstained: parse failed: x"},
+        "b": {"value": 0.0, "abstained": True, "reasoning": "abstained: LLM call failed: y"},
+        "c": {"value": 0.0, "abstained": True, "reasoning": "abstained: LLM call failed: z"},
+    }
+    assert list(failure_reasons(views)) == ["LLM call failed", "parse failed"]
+
+
+def test_excluded_summary_carries_the_reason_beside_the_ratio():
+    """The line the operator actually reads, in the log and in the email."""
+    from bridge.run_daily import excluded_summary
+    per_ticker = {
+        "ALOY": {f"p{i}": {"value": 0.0, "abstained": True,
+                           "reasoning": "abstained: insufficient data: only 3 "
+                                        "filed periods (need 4)"}
+                 for i in range(7)} | {"pead": {"value": 0.0, "reasoning": "n"}},
+    }
+    out = excluded_summary({"ALOY": 0.875}, per_ticker)
+    assert out == "ALOY 88% failed (insufficient data ×7)"
+
+
+def test_excluded_summary_says_so_when_the_reason_is_unrecorded():
+    """An exclusion whose views carry no reason must say that, not print a
+    bare ratio that reads as if nobody looked. Absent is never a blank."""
+    from bridge.run_daily import excluded_summary
+    out = excluded_summary({"ZZZ": 1.0}, {"ZZZ": {}})
+    assert out == "ZZZ 100% failed (reason unrecorded)"

@@ -302,3 +302,24 @@ def test_a_plain_parse_failure_is_not_retried(tmp_path):
     # Assert
     assert sig.metadata["abstained"] is True
     assert len(llm.prompts) == 1
+
+
+# ---------------------------------------------------------------------------
+# The insufficient-data abstain has to say so out loud
+#
+# 2026-08-21. The [ai-hedge-fund] digest read "🔴 excluded (dead committee,
+# held as-is): ALOY 88% failed" and the whole run logged one warning, for a
+# different ticker. Seven personas had abstained through this path and it was
+# the only abstain path in the file with no logger call, so the cause left no
+# trace anywhere an operator looks.
+# ---------------------------------------------------------------------------
+
+def test_insufficient_data_abstain_is_logged(caplog):
+    agent = BuffettAgent(llm=FakeLLM(response="{}"))
+    client = MockDataClient(metrics=_history(2))  # under MIN_PERIODS
+    with caplog.at_level("WARNING"):
+        sig = agent.predict("ALOY", "2026-08-21", client)
+    assert sig.metadata["abstained"] is True
+    assert "insufficient data" in sig.reasoning
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "ALOY" in logged and "insufficient data" in logged

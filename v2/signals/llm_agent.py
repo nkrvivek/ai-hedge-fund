@@ -64,6 +64,11 @@ class LLMAgent(AlphaModel):
         try:
             snapshot = self.build_snapshot(ticker, date, data_client)
         except InsufficientData as exc:
+            # Logged like every other abstain path. Until 2026-08-21 this one
+            # was silent, so a committee killed by thin filings printed a
+            # percentage in the digest and left nothing in the run log.
+            logger.warning("%s insufficient data for %s@%s: %s",
+                           self.name, ticker, date, exc)
             return self._abstain(ticker, date, f"insufficient data: {exc}")
         # Any other data-layer exception (e.g. FDClientError) propagates.
 
