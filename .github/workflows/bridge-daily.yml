@@ -22,7 +22,14 @@ jobs:
           restore-keys: v2cache-
       - name: run bridge
         env:
-          FINANCIAL_DATASETS_API_KEY: ${{ secrets.FINANCIAL_DATASETS_API_KEY }}
+          # 2026-08-21: financialdatasets.ai (fundamentals fallback #2) is not
+          # being topped up. The account answers 402 with balance 0.00 and the
+          # user declined further data spend. Leaving the secret mapped bought a
+          # wasted request and a 402 for every ticker FMP and UW both went blind
+          # on, and that dead leg is what the ALOY dead-committee exclusion ran
+          # through. Unmapped, run_daily prints "fundamentals fallback #2: OFF"
+          # and the chain is FMP -> UW statements. Re-map the secret if the
+          # balance is ever restored.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
