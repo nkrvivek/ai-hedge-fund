@@ -68,12 +68,28 @@ class AlpacaPaper:
         """Raw position dicts — the index-hedge sleeve needs qty/cost_basis."""
         return self._req("GET", "/positions") or []
 
+    def _assert_market_open(self) -> None:
+        """Hard stop immediately before every broker write.
+
+        Alpaca accepts DAY orders after hours and queues them for the next open.
+        A late scheduler run must instead be a true no-op, never latent risk.
+        """
+        clock = self._req("GET", "/clock") or {}
+        if clock.get("is_open") is not True:
+            next_open = clock.get("next_open") or "unknown"
+            raise AlpacaPaperError(
+                f"refusing broker write while market is closed "
+                f"(next open {next_open})"
+            )
+
     def submit_market_order(self, symbol: str, notional_or_qty: dict) -> dict:
+        self._assert_market_open()
         body = {"symbol": symbol, "type": "market", "time_in_force": "day", **notional_or_qty}
         return self._req("POST", "/orders", json=body)
 
     def submit_limit_order(self, symbol: str, *, qty: int, side: str,
                            limit_price: float) -> dict:
+        self._assert_market_open()
         body = {"symbol": symbol, "qty": str(qty), "side": side, "type": "limit",
                 "limit_price": str(round(limit_price, 2)), "time_in_force": "day"}
         return self._req("POST", "/orders", json=body)
@@ -128,6 +144,7 @@ class AlpacaPaper:
         """Liquidate the full position via Alpaca's close-position endpoint —
         broker-sized, so a stale local market value can never oversell (the
         2026-07-23 META insufficient-qty failure class)."""
+        self._assert_market_open()
         return self._req("DELETE", f"/positions/{symbol}")
 
     def snapshot_movers(self, symbols: list[str]) -> dict[str, tuple[float, float]]:

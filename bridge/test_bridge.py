@@ -198,6 +198,56 @@ def test_paper_endpoint_guard(monkeypatch):
         AlpacaPaper()
 
 
+@pytest.mark.parametrize("broker_write", [
+    lambda client: client.submit_market_order(
+        "AAPL", {"qty": "1", "side": "buy"}
+    ),
+    lambda client: client.submit_limit_order(
+        "AAPL", qty=1, side="buy", limit_price=100.0
+    ),
+    lambda client: client.close_position("AAPL"),
+])
+def test_all_broker_writes_refuse_a_closed_market(broker_write):
+    from bridge.alpaca import AlpacaPaper, AlpacaPaperError
+
+    client = AlpacaPaper.__new__(AlpacaPaper)
+    calls = []
+
+    def fake_req(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if (method, path) == ("GET", "/clock"):
+            return {"is_open": False, "next_open": "2026-08-31T09:30:00-04:00"}
+        raise AssertionError(f"broker write reached while closed: {method} {path}")
+
+    client._req = fake_req
+    with pytest.raises(AlpacaPaperError, match="market is closed"):
+        broker_write(client)
+    assert [(method, path) for method, path, _ in calls] == [("GET", "/clock")]
+
+
+def test_market_order_checks_open_clock_immediately_before_submit():
+    from bridge.alpaca import AlpacaPaper
+
+    client = AlpacaPaper.__new__(AlpacaPaper)
+    calls = []
+
+    def fake_req(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if (method, path) == ("GET", "/clock"):
+            return {"is_open": True}
+        if (method, path) == ("POST", "/orders"):
+            return {"id": "paper-order", "status": "accepted"}
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client._req = fake_req
+    out = client.submit_market_order("AAPL", {"qty": "1", "side": "buy"})
+    assert out["id"] == "paper-order"
+    assert [(method, path) for method, path, _ in calls] == [
+        ("GET", "/clock"),
+        ("POST", "/orders"),
+    ]
+
+
 def test_rebalance_holds_excluded_ticker_as_is():
     """A per-ticker-excluded symbol gets no order at all — held as-is, not
     force-sold — even though it carries no target weight and the diff
