@@ -1,0 +1,12 @@
+name = "ai-hedge-fund-dispatch"
+main = "src/index.js"
+compatibility_date = "2025-09-15"
+account_id = "3e2617436093fffd3446428537e90efd"
+
+[triggers]
+# Cloudflare numbers weekdays 1=Sunday, so Mon-Fri is 2-6.
+crons = ["35 14 * * 2-6"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1

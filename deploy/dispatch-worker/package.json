@@ -1,0 +1,11 @@
+{
+  "name": "ai-hedge-fund-dispatch-worker",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "4.107.0"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy -c wrangler.toml"
+  }
+}

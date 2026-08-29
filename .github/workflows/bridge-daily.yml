@@ -1,7 +1,5 @@
 name: bridge-daily
 on:
-  schedule:
-    - cron: "35 14 * * 1-5"   # 10:35 ET — post-open, settled prices
   workflow_dispatch: {}
 permissions:
   contents: write
