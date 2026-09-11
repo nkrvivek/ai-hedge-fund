@@ -1,5 +1,14 @@
 # AI Hedge Fund
 
+> **RETIRED 2026-09-11.** The `bridge/` Alpaca-paper committee book (account
+> PA3GFFYS3PYL) was retired in full after failing its probation review
+> (DJ-20260810-05, review due 2026-09-10; last scored hit rate 0.476, below
+> the 0.50 bar) on explicit user directive. The Cloudflare dispatch worker's
+> cron is emptied, the `bridge-daily.yml` GitHub Actions workflow is
+> disabled, and the paper account has been flattened. See `AGENTS.md` for
+> the full retirement record. The rest of this README (below) describes the
+> original, upstream `ai-hedge-fund` proof of concept and is left as history.
+
 This is a proof of concept for an AI-powered hedge fund.  The goal of this project is to explore the use of AI to make trading decisions.  This project is for **educational** purposes only and is not intended for real trading or investment.
 
 > **🚧 The project is evolving.** We're rebuilding it into a persistent, always-on AI hedge fund — a *fund* as a first-class entity you can backtest, paper-trade, and (opt-in) run live, with the investor agents reimagined as pluggable, backtestable "alpha models." Read the **[Vision →](VISION.md)** and the **[Roadmap →](ROADMAP.md)**.

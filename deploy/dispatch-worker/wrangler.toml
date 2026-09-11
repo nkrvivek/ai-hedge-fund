@@ -4,8 +4,10 @@ compatibility_date = "2025-09-15"
 account_id = "3e2617436093fffd3446428537e90efd"
 
 [triggers]
-# Cloudflare numbers weekdays 1=Sunday, so Mon-Fri is 2-6.
-crons = ["35 14 * * 2-6"]
+# RETIRED 2026-09-11 (probation review DJ-20260810-05, user directive: "we can
+# retire ai-hedge-fund book fully"). Schedule emptied; worker kept for /status
+# parity only, same pattern as the hackathon book's retirement.
+crons = []
 
 [observability]
 enabled = true
